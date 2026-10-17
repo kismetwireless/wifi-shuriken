@@ -50,6 +50,9 @@
 #ifndef SCANNER_SPI_CLOCK
 #define SCANNER_SPI_CLOCK 20000000  
 #endif
+#ifndef SCANNER_SPI_BULK_CLOCK
+#define SCANNER_SPI_BULK_CLOCK SCANNER_SPI_CLOCK  // SPI clock for packet batch reads.
+#endif
 
 // Enable RP2040 internal pull-up on scanner MISO to keep idle bus high
 // when all scanner slaves are deasserted/tri-stated.
@@ -183,6 +186,37 @@
 #define CONTROLLER_SD_UPDATE_CHUNK_BYTES 1024
 #endif
 
+// Monitor-mode load probe. When enabled, core1 puts every monitor-capable
+// scanner into promiscuous capture instead of scanning, rotates the slots
+// across a channel list, and prints per-slot radio load once a second. No CSV
+// rows are produced while it runs.
+#ifndef SCANNER_MONITOR_PROBE
+#define SCANNER_MONITOR_PROBE 0
+#endif
+#ifndef SCANNER_MONITOR_PROBE_DWELL_MS
+#define SCANNER_MONITOR_PROBE_DWELL_MS 10000
+#endif
+#ifndef SCANNER_MONITOR_PROBE_TYPE_MASK
+#define SCANNER_MONITOR_PROBE_TYPE_MASK 0x07  // MONITOR_TYPE_* bits.
+#endif
+#ifndef SCANNER_MONITOR_PROBE_SNAPLEN_DATA
+#define SCANNER_MONITOR_PROBE_SNAPLEN_DATA 256
+#endif
+#ifndef SCANNER_MONITOR_PROBE_SPI_DRAIN
+#define SCANNER_MONITOR_PROBE_SPI_DRAIN 1  // 1 = read captured frames over SPI batches.
+#endif
+#ifndef SCANNER_MONITOR_PROBE_SYNTHETIC_KIBPS
+// Nonzero: scanners generate synthetic records instead of capturing, and each
+// dwell raises every slot's rate by this many KiB/s (a capacity ramp). Record
+// body size comes from SCANNER_MONITOR_PROBE_SNAPLEN_DATA.
+#define SCANNER_MONITOR_PROBE_SYNTHETIC_KIBPS 0
+#endif
+#ifndef SCANNER_MONITOR_PROBE_DRAIN_KIBPS
+// With SPI_DRAIN 0 the scanner discards frames itself at this rate
+// (0 = unthrottled) to load-test the radio without the SPI path.
+#define SCANNER_MONITOR_PROBE_DRAIN_KIBPS 0
+#endif
+
 // SD-card firmware update settings for attached ESP32-C5 scanner builds. When
 // scanner.bin is present, the controller sends it over the scanner SPI bus at
 // boot before core1 starts normal scan scheduling.
@@ -273,6 +307,37 @@
 #define SCANNER_SCAN_FIRST_PULL_DELAY_US 5000
 #endif
 
+// Vendor-class USB packet capture interface (see usb_capture_protocol.h).
+// 1 registers the interface; 0 leaves the USB descriptor unchanged.
+#ifndef USB_CAPTURE_ENABLED
+#define USB_CAPTURE_ENABLED 1
+#endif
+// Controller-side packet ring between the packet producer and the USB pump.
+// Must be a power of two. Sized to ride out SD-write stalls on core0.
+#ifndef USB_CAPTURE_PACKET_RING_BYTES
+#define USB_CAPTURE_PACKET_RING_BYTES 131072
+#endif
+// Ring for replies and status records. Must be a power of two.
+#ifndef USB_CAPTURE_CONTROL_RING_BYTES
+#define USB_CAPTURE_CONTROL_RING_BYTES 4096
+#endif
+// An active capture session stops if the host sends no command for this long.
+#ifndef USB_CAPTURE_KEEPALIVE_TIMEOUT_MS
+#define USB_CAPTURE_KEEPALIVE_TIMEOUT_MS 5000
+#endif
+// Interval between unsolicited status records while a session is active.
+#ifndef USB_CAPTURE_STATUS_INTERVAL_MS
+#define USB_CAPTURE_STATUS_INTERVAL_MS 1000
+#endif
+// Synthetic beacon generator for exercising the USB path without radios.
+#ifndef USB_CAPTURE_SYNTHETIC_ENABLED
+#define USB_CAPTURE_SYNTHETIC_ENABLED 1
+#endif
+// Cap on synthetic frames generated per core0 loop pass.
+#ifndef USB_CAPTURE_SYNTHETIC_MAX_PER_LOOP
+#define USB_CAPTURE_SYNTHETIC_MAX_PER_LOOP 32
+#endif
+
 #if defined(USE_TINYUSB)
 // USB string descriptor defaults for TinyUSB builds.
 #ifndef USB_DEVICE_MANUFACTURER_NAME
@@ -289,5 +354,8 @@
 #endif
 #ifndef USB_CDC1_IFACE_NAME
 #define USB_CDC1_IFACE_NAME "NMEA"  // Secondary CDC interface label.
+#endif
+#ifndef USB_CAPTURE_IFACE_NAME
+#define USB_CAPTURE_IFACE_NAME "Shuriken Capture"  // Packet capture interface label.
 #endif
 #endif

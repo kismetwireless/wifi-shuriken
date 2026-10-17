@@ -3,6 +3,7 @@
 #include "wifi_dedupe.h"
 #include "wifi_result_utils.h"
 #include "scanner_platform_esp32_radio.h"
+#include "scanner_platform_esp32_monitor.h"
 #include "scanner_platform_esp32_spi.h"
 #include "ScannerConfiguration.h"
 #include <esp_system.h>
@@ -46,6 +47,8 @@ static constexpr uint16_t ACTIVE_DWELL_MS  = 110;
 static constexpr uint16_t PASSIVE_DWELL_MS = 210;
 static constexpr uint8_t BAND_5_GHZ = 5;
 static constexpr uint16_t SPI_RX_TIMEOUT_MS = 50;
+// Monitor mode drains the capture ring between SPI transactions, so wait less.
+static constexpr uint16_t SPI_RX_TIMEOUT_MONITOR_MS = 2;
 static constexpr uint8_t SPI_TRANSACTION_QUEUE_SIZE = 4;
 static constexpr uint8_t SCAN_RESULT_PROCESS_BUDGET = 16;
 
@@ -56,6 +59,33 @@ static constexpr size_t FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
 
 static uint8_t rx_buf[FRAME_SIZE] __attribute__((aligned(4)));
 static uint8_t tx_buf[FRAME_SIZE] __attribute__((aligned(4)));
+
+// ---------- Packet batch transport ----------
+// After CMD_PKT_READ the reply frame and the bulk batch read are queued with
+// the SPI driver as a pair, so the bulk transaction is armed by the driver the
+// moment the master pulls the reply, with no main-loop latency in between.
+// See spi_protocol_shared.h for the exchange.
+enum class TxnKind : uint8_t {
+  Frame = 0,   // Ordinary 64-byte command frame.
+  Header = 1,  // Frame carrying a PktReadReply, followed by a Bulk.
+  Bulk = 2,    // Batch read of bulk_wire_len bytes.
+  Trail = 3,   // Frame queued behind a Bulk, using trail_tx/trail_rx.
+};
+
+static TxnKind queued_kind[SCANNER_SPI_MAX_QUEUED] = {};
+// Set by CMD_PKT_READ; the next queue operation sends Header + Bulk.
+static bool bulk_pair_requested = false;
+// A bulk read that ended short is re-armed on its own.
+static bool bulk_rearm_requested = false;
+static uint16_t bulk_wire_len = 0;
+static uint8_t bulk_tx[PKT_BATCH_MAX_BYTES] __attribute__((aligned(4)));
+// Frame queued behind every bulk read so one is armed the instant the batch
+// completes; the master's next command would otherwise land before the main
+// loop re-queues. It has its own buffers so it cannot clobber the reply frame.
+static uint8_t trail_tx[FRAME_SIZE] __attribute__((aligned(4)));
+static uint8_t trail_rx[FRAME_SIZE] __attribute__((aligned(4)));
+static uint8_t bulk_rx[PKT_BATCH_MAX_BYTES] __attribute__((aligned(4)));
+static PktDiagReply bulk_diag = {};
 
 // Boot diagnostics are emitted repeatedly for a short window so they remain visible
 // even when USB CDC enumeration lags behind firmware startup.
@@ -139,6 +169,12 @@ static const char* cmd_to_str(uint8_t cmd) {
     case CMD_OTA_DATA: return "OTA_DATA";
     case CMD_OTA_END: return "OTA_END";
     case CMD_OTA_ABORT: return "OTA_ABORT";
+    case CMD_MONITOR_START: return "MONITOR_START";
+    case CMD_MONITOR_STOP: return "MONITOR_STOP";
+    case CMD_MONITOR_STATS: return "MONITOR_STATS";
+    case CMD_PKT_READ: return "PKT_READ";
+    case CMD_PKT_DIAG: return "PKT_DIAG";
+    case CMD_MONITOR_HOP: return "MONITOR_HOP";
     default: return "UNKNOWN";
   }
 }
@@ -541,7 +577,7 @@ static void handleCmdId() {
   DeviceIdReply id = {};
   id.proto_version = PROTO_VERSION;
   id.scanner_type  = SCANNER_TYPE_ESP32_C5;
-  id.capabilities  = (CAP_BAND_24GHZ | CAP_BAND_5GHZ | CAP_OTA_UPDATE);
+  id.capabilities  = (CAP_BAND_24GHZ | CAP_BAND_5GHZ | CAP_OTA_UPDATE | CAP_MONITOR);
   id.max_results   = PROTO_MAX_RESULTS;
   memcpy(tx_buf, &id, sizeof(id));
   DBG_PRINTF("[SPI] rsp ID => proto=%u type=%u caps=0x%02X max=%u\n",
@@ -553,8 +589,10 @@ static void handleCmdScan() {
   ScanCommand sc = {};
   memcpy(&sc, rx_buf, sizeof(sc));
 
-  // Reject new scans while a previous scan/snapshot/buffer is still in flight.
-  if (scan_phase != ScanPhase::Idle ||
+  // Reject new scans while a previous scan/snapshot/buffer is still in flight,
+  // or while the radio is owned by monitor mode.
+  if (scannerMonitorActive() ||
+      scan_phase != ScanPhase::Idle ||
       spi_status != SCANNER_STATUS_OK) {
     last_scan_status = SCANNER_STATUS_BUSY;
   } else if (!wifiBandChannelValid(sc.band, sc.channel)) {
@@ -642,6 +680,8 @@ static void handleCmdOtaBegin() {
 
   abortOtaState();
   clear_spi_result_buffer();
+  // An update always wins over capture so a bad probe build stays recoverable.
+  scannerMonitorStop();
   scannerStatusLedSet(true);
 
   if (!Update.begin(begin.image_size, U_FLASH)) {
@@ -841,6 +881,72 @@ static void handleCmdOtaAbort() {
   SCANNER_LOG_PRINTLN("Scanner OTA aborted by controller");
 }
 
+static void handleCmdMonitorStart() {
+  MonitorStartCommand start = {};
+  memcpy(&start, rx_buf, sizeof(start));
+
+  int8_t status = SCANNER_STATUS_OK;
+  if (ota_state.active) {
+    status = SCANNER_STATUS_BUSY;
+  } else {
+    // Monitor mode takes the radio from scanning: drop any scan in flight and
+    // results not yet read rather than making the controller wait them out.
+    if (scan_phase != ScanPhase::Idle || spi_status != SCANNER_STATUS_OK) {
+      abortScanAndSetIdle();
+    }
+    status = scannerMonitorStart(start);
+  }
+  write_status_response(status);
+  SCANNER_LOG_PRINTF("Monitor start band %u ch %u mask 0x%02X snap %u/%u/%u drain %u KiB/s => %d\n",
+                     start.band, start.channel, start.type_mask, start.snaplen_mgmt,
+                     start.snaplen_ctrl, start.snaplen_data, start.drain_kib_per_s, status);
+}
+
+static void handleCmdMonitorHop() {
+  MonitorHopCommand hop = {};
+  memcpy(&hop, rx_buf, sizeof(hop));
+  write_status_response(scannerMonitorSetHop(hop));
+}
+
+static void handleCmdMonitorStop() {
+  scannerMonitorStop();
+  write_status_response(SCANNER_STATUS_OK);
+  SCANNER_LOG_PRINTLN("Monitor stopped");
+}
+
+static void handleCmdPktRead() {
+  PktReadCommand command = {};
+  memcpy(&command, rx_buf, sizeof(command));
+  PktReadReply reply = {};
+  if (scannerSpiSlavePending() != 0) {
+    // A bulk read from an abandoned exchange is still queued on bulk_tx; do
+    // not rebuild under it. The master retries once that transaction drains.
+    reply.status = SCANNER_STATUS_BUSY;
+    memcpy(tx_buf, &reply, sizeof(reply));
+    return;
+  }
+  const uint16_t wire_len = scannerMonitorPrepareBatch(command, bulk_tx, reply);
+  memcpy(tx_buf, &reply, sizeof(reply));
+  if (wire_len > 0) {
+    bulk_wire_len = wire_len;
+    bulk_pair_requested = true;
+    bulk_diag.batches_built++;
+  }
+}
+
+static void handleCmdPktDiag() {
+  bulk_diag.status = SCANNER_STATUS_OK;
+  bulk_diag.bulk_state = scannerSpiSlavePending();
+  bulk_diag.wire_len = bulk_wire_len;
+  memcpy(tx_buf, &bulk_diag, sizeof(bulk_diag));
+}
+
+static void handleCmdMonitorStats() {
+  MonitorStatsReply stats = {};
+  scannerMonitorFillStats(stats);
+  memcpy(tx_buf, &stats, sizeof(stats));
+}
+
 // ---------- Command handling ----------
 // This fills tx_buf with the *next* response (to be clocked out on the next transaction).
 static void handle_command(uint8_t cmd_byte) {
@@ -867,6 +973,12 @@ static void handle_command(uint8_t cmd_byte) {
     case CMD_OTA_DATA: handleCmdOtaData(); break;
     case CMD_OTA_END: handleCmdOtaEnd(); break;
     case CMD_OTA_ABORT: handleCmdOtaAbort(); break;
+    case CMD_MONITOR_START: handleCmdMonitorStart(); break;
+    case CMD_MONITOR_STOP: handleCmdMonitorStop(); break;
+    case CMD_MONITOR_STATS: handleCmdMonitorStats(); break;
+    case CMD_PKT_READ: handleCmdPktRead(); break;
+    case CMD_PKT_DIAG: handleCmdPktDiag(); break;
+    case CMD_MONITOR_HOP: handleCmdMonitorHop(); break;
 
     default:
       // Unknown command: return 0
@@ -898,7 +1010,7 @@ void setup() {
   delay(100);
 
   if (!scannerSpiSlaveInit(PIN_SCK, PIN_MOSI, PIN_MISO, PIN_CS,
-                           FRAME_SIZE, SPI_TRANSACTION_QUEUE_SIZE)) {
+                           PKT_BATCH_MAX_BYTES, SPI_TRANSACTION_QUEUE_SIZE)) {
     SCANNER_LOG_PRINTLN("scannerSpiSlaveInit failed");
     while (1) delay(1000);
   }
@@ -919,12 +1031,48 @@ void loop() {
   emitBootDiagnosticsIfDue();
   // Always progress scan state even if the master is quiet.
   update_scan_state();
+  scannerMonitorService();
 
-  // Ensure rx_buf doesn't contain stale data (not strictly required, but helps debugging).
-  memset(rx_buf, 0, FRAME_SIZE);
+  // Keep the driver fed: the next frame, a Header + Bulk pair after
+  // CMD_PKT_READ, or a re-armed Bulk after a short read.
+  if (scannerSpiSlavePending() == 0) {
+    ScannerSpiTransaction txns[SCANNER_SPI_MAX_QUEUED] = {};
+    uint8_t count = 0;
+    memset(trail_tx, 0, FRAME_SIZE);
+    trail_tx[FRAME_TAG_INDEX] = CMD_NOP;
+    if (bulk_pair_requested) {
+      txns[0] = {tx_buf, rx_buf, FRAME_SIZE};
+      txns[1] = {bulk_tx, bulk_rx, bulk_wire_len};
+      txns[2] = {trail_tx, trail_rx, FRAME_SIZE};
+      queued_kind[0] = TxnKind::Header;
+      queued_kind[1] = TxnKind::Bulk;
+      queued_kind[2] = TxnKind::Trail;
+      count = 3;
+    } else if (bulk_rearm_requested) {
+      txns[0] = {bulk_tx, bulk_rx, bulk_wire_len};
+      txns[1] = {trail_tx, trail_rx, FRAME_SIZE};
+      queued_kind[0] = TxnKind::Bulk;
+      queued_kind[1] = TxnKind::Trail;
+      count = 2;
+    } else {
+      txns[0] = {tx_buf, rx_buf, FRAME_SIZE};
+      queued_kind[0] = TxnKind::Frame;
+      count = 1;
+    }
+    bulk_pair_requested = false;
+    bulk_rearm_requested = false;
+    if (!scannerSpiSlaveQueue(txns, count)) {
+      DBG_PRINTLN("[SPI] queue failed");
+      return;
+    }
+  }
 
   // Wait for a SPI transaction; timeout keeps async scan polling progressing.
-  const int ret = scannerSpiSlaveTransfer(tx_buf, rx_buf, FRAME_SIZE, SPI_RX_TIMEOUT_MS);
+  uint8_t index = 0;
+  size_t received_bits = 0;
+  const int ret = scannerSpiSlaveWait(scannerMonitorActive() ? SPI_RX_TIMEOUT_MONITOR_MS
+                                                             : SPI_RX_TIMEOUT_MS,
+                                      &index, &received_bits);
 
   if (ret == SCANNER_SPI_TRANSFER_TIMEOUT) {
     // No SPI activity this slice; keep looping to update scan state.
@@ -941,6 +1089,43 @@ void loop() {
     ESP.restart();
   }
 
+  const TxnKind kind = queued_kind[index];
+  if (kind == TxnKind::Trail) {
+    // An ordinary frame that happened to be pre-armed; its command is handled
+    // like any other.
+    memcpy(rx_buf, trail_rx, FRAME_SIZE);
+  } else if (kind == TxnKind::Bulk) {
+    // Classify by length with a word of slack: the C5 driver reports a few
+    // bits more than the master clocked.
+    if (received_bits + 32u >= static_cast<size_t>(bulk_wire_len) * 8u) {
+      // Batch delivered; it is released when the next CMD_PKT_READ acks it.
+      bulk_diag.bulk_full++;
+      bulk_diag.last_full_bits = received_bits;
+      return;
+    }
+    if (received_bits + 32u < FRAME_SIZE * 8u) {
+      // A partial transfer (the master clocked before the bulk was armed, or
+      // gave up mid-read) is neither a batch nor a command; re-arm it.
+      bulk_diag.bulk_partial++;
+      bulk_diag.last_partial_bits = received_bits;
+      bulk_rearm_requested = true;
+      return;
+    }
+    // About one command frame: the master abandoned the batch.
+    bulk_diag.bulk_command++;
+    bulk_diag.last_command_bits = received_bits;
+    memcpy(rx_buf, bulk_rx, FRAME_SIZE);
+  } else if (kind == TxnKind::Header) {
+    if (rx_buf[0] == CMD_NOP) {
+      // The master has the batch reply; the driver has already armed the bulk.
+      memset(rx_buf, 0, FRAME_SIZE);
+      return;
+    }
+    // The master moved on without pulling the reply. Handle its command; the
+    // queued bulk then completes as one frame and is handled as a command too.
+    bulk_diag.header_abandoned++;
+  }
+
   // Transaction completed: rx_buf now contains the command from the master.
   const uint8_t cmd = rx_buf[0];
   otaLogRawFrame(cmd);
@@ -950,4 +1135,9 @@ void loop() {
   // delays re-queueing the next slave transaction and can make the master miss
   // the response poll entirely.
   handle_command(cmd);
+
+  // Clear the command only now: rx_buf is the DMA target of the queued slave
+  // transaction, so wiping it at the top of loop() races an incoming frame and
+  // turns the command into a NOP. The next transaction is queued after this.
+  memset(rx_buf, 0, FRAME_SIZE);
 }

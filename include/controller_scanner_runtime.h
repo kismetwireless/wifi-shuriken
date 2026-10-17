@@ -45,3 +45,59 @@ bool controllerScannerRuntimeHandleScannerUpdatesFromSd(SdFat& sd,
 
 // Run the scanner service loop on core1 forever.
 void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context);
+
+// ---------- Monitor mode hand-off (core0 -> core1) ----------
+// The USB capture session (core0) asks core1 to take scanners out of scanning
+// and into promiscuous capture; core1 applies the request between slot
+// services, streams captured frames into the USB packet ring, and reports
+// per-slot state back.
+static constexpr uint8_t CONTROLLER_MONITOR_MAX_SLOTS = 8;
+static constexpr uint8_t CONTROLLER_MONITOR_MAX_HOP = 64;
+
+struct ControllerMonitorHopEntry {
+  uint8_t band;
+  uint8_t channel;
+};
+
+struct ControllerMonitorSlotConfig {
+  uint8_t band;
+  uint8_t channel;
+  uint8_t type_mask;  // MONITOR_TYPE_* bits.
+  uint16_t snaplen_mgmt;
+  uint16_t snaplen_ctrl;
+  uint16_t snaplen_data;
+  // When hopping, the scanner retunes through hop[] every hop_dwell_ms on its
+  // own, starting at hop_offset; band/channel are then ignored.
+  bool hopping;
+  uint8_t hop_count;
+  uint8_t hop_offset;
+  uint16_t hop_dwell_ms;
+  ControllerMonitorHopEntry hop[CONTROLLER_MONITOR_MAX_HOP];
+};
+
+struct ControllerMonitorRequest {
+  bool active;
+  uint8_t slot_mask;
+  ControllerMonitorSlotConfig slot[CONTROLLER_MONITOR_MAX_SLOTS];
+};
+
+struct ControllerMonitorSlotStatus {
+  bool present;
+  bool monitoring;
+  bool hopping;
+  // Channel the radio is on now (follows the hops).
+  uint8_t band;
+  uint8_t channel;
+  // Cumulative since the slot last entered monitor mode.
+  uint32_t radio_drops;
+  uint32_t transport_errors;
+};
+
+// core0: replace the current request. Takes effect asynchronously.
+void controllerScannerMonitorRequest(const ControllerMonitorRequest& request);
+
+// core0: true once core1 has applied the most recent request.
+bool controllerScannerMonitorApplied();
+
+// core0: latest state core1 reported for a slot.
+void controllerScannerMonitorSlotStatus(uint8_t slot, ControllerMonitorSlotStatus& out);

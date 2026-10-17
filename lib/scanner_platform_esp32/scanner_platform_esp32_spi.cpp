@@ -8,30 +8,38 @@
 #include <freertos/task.h>
 #include <string.h>
 
-// Keep a single persistent queued transaction so timeouts do not leave
-// the SPI ISR with a dangling pointer to a stack-local transaction object.
-static spi_slave_transaction_t g_pending_trans = {};
-static bool g_trans_queued = false;
+// Queued transactions live in persistent storage so timeouts never leave the
+// SPI ISR holding a pointer to a stack-local transaction object. Results come
+// back in queue order, so g_next_result walks the same array.
+static spi_slave_transaction_t g_trans[SCANNER_SPI_MAX_QUEUED] = {};
+static uint8_t g_queued = 0;
+static uint8_t g_next_result = 0;
 static bool g_spi_initialized = false;
+
+static void resetQueueState() {
+  memset(g_trans, 0, sizeof(g_trans));
+  g_queued = 0;
+  g_next_result = 0;
+}
 
 bool scannerSpiSlaveInit(int pin_sck,
                          int pin_mosi,
                          int pin_miso,
                          int pin_cs,
-                         size_t frame_size,
+                         size_t max_transfer_bytes,
                          uint8_t queue_size) {
-  // ESP32-C5 slave mode runs on SPI2 host; fixed frame_size keeps DMA/simple framing aligned.
+  // ESP32-C5 slave mode runs on SPI2 host.
   spi_bus_config_t buscfg = {};
   buscfg.mosi_io_num = pin_mosi;
   buscfg.miso_io_num = pin_miso;
   buscfg.sclk_io_num = pin_sck;
   buscfg.quadwp_io_num = -1;
   buscfg.quadhd_io_num = -1;
-  buscfg.max_transfer_sz = frame_size;
+  buscfg.max_transfer_sz = max_transfer_bytes;
 
   spi_slave_interface_config_t slvcfg = {};
   slvcfg.spics_io_num = pin_cs;
-  slvcfg.queue_size = queue_size;
+  slvcfg.queue_size = queue_size < SCANNER_SPI_MAX_QUEUED ? SCANNER_SPI_MAX_QUEUED : queue_size;
   slvcfg.mode = 0;
 
   const esp_err_t ret = spi_slave_initialize(
@@ -47,31 +55,40 @@ bool scannerSpiSlaveInit(int pin_sck,
     return false;
   }
 
-  memset(&g_pending_trans, 0, sizeof(g_pending_trans));
-  g_trans_queued = false;
+  resetQueueState();
   g_spi_initialized = true;
   return true;
 }
 
-int scannerSpiSlaveTransfer(const uint8_t* tx_buf,
-                            uint8_t* rx_buf,
-                            size_t frame_size,
-                            uint32_t timeout_ms) {
-  if (!g_spi_initialized) {
-    return SCANNER_SPI_TRANSFER_ERROR;
-  }
+uint8_t scannerSpiSlavePending() {
+  return static_cast<uint8_t>(g_queued - g_next_result);
+}
 
-  // Queue one persistent transaction if none is currently pending.
-  if (!g_trans_queued) {
-    memset(&g_pending_trans, 0, sizeof(g_pending_trans));
-    g_pending_trans.length = frame_size * 8;
-    g_pending_trans.tx_buffer = tx_buf;
-    g_pending_trans.rx_buffer = rx_buf;
-    const esp_err_t qret = spi_slave_queue_trans(SPI2_HOST, &g_pending_trans, 0);
-    if (qret != ESP_OK) {
-      return SCANNER_SPI_TRANSFER_ERROR;
+bool scannerSpiSlaveQueue(const ScannerSpiTransaction* transactions, uint8_t count) {
+  if (!g_spi_initialized || scannerSpiSlavePending() != 0 || count == 0 ||
+      count > SCANNER_SPI_MAX_QUEUED) {
+    return false;
+  }
+  resetQueueState();
+  for (uint8_t i = 0; i < count; i++) {
+    spi_slave_transaction_t& trans = g_trans[i];
+    trans.length = transactions[i].length * 8;
+    trans.tx_buffer = transactions[i].tx_buf;
+    trans.rx_buffer = transactions[i].rx_buf;
+    if (spi_slave_queue_trans(SPI2_HOST, &trans, 0) != ESP_OK) {
+      // Earlier entries are already with the driver and still complete in
+      // order; only report what made it in.
+      g_queued = i;
+      return false;
     }
-    g_trans_queued = true;
+    g_queued = static_cast<uint8_t>(i + 1);
+  }
+  return true;
+}
+
+int scannerSpiSlaveWait(uint32_t timeout_ms, uint8_t* index, size_t* received_bits) {
+  if (!g_spi_initialized || scannerSpiSlavePending() == 0) {
+    return SCANNER_SPI_TRANSFER_ERROR;
   }
 
   spi_slave_transaction_t* completed = nullptr;
@@ -80,17 +97,31 @@ int scannerSpiSlaveTransfer(const uint8_t* tx_buf,
   if (ret == ESP_ERR_TIMEOUT) {
     return SCANNER_SPI_TRANSFER_TIMEOUT;
   }
-  if (ret != ESP_OK) {
-    g_trans_queued = false;
-    memset(&g_pending_trans, 0, sizeof(g_pending_trans));
-    return SCANNER_SPI_TRANSFER_ERROR;
-  }
-  if (completed != &g_pending_trans) {
-    g_trans_queued = false;
-    memset(&g_pending_trans, 0, sizeof(g_pending_trans));
+  if (ret != ESP_OK || completed != &g_trans[g_next_result]) {
+    resetQueueState();
     return SCANNER_SPI_TRANSFER_ERROR;
   }
 
-  g_trans_queued = false;
+  if (index != nullptr) {
+    *index = g_next_result;
+  }
+  if (received_bits != nullptr) {
+    *received_bits = completed->trans_len;
+  }
+  g_next_result++;
   return SCANNER_SPI_TRANSFER_OK;
+}
+
+int scannerSpiSlaveTransfer(const uint8_t* tx_buf,
+                            uint8_t* rx_buf,
+                            size_t length,
+                            uint32_t timeout_ms,
+                            size_t* received_bits) {
+  if (scannerSpiSlavePending() == 0) {
+    const ScannerSpiTransaction trans = {tx_buf, rx_buf, length};
+    if (!scannerSpiSlaveQueue(&trans, 1)) {
+      return SCANNER_SPI_TRANSFER_ERROR;
+    }
+  }
+  return scannerSpiSlaveWait(timeout_ms, nullptr, received_bits);
 }

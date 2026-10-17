@@ -21,6 +21,7 @@
 #include "controller_mtp_storage.h"
 #include "controller_scanner_runtime.h"
 #include "controller_status.h"
+#include "controller_usb_capture.h"
 #include "controller_update_runtime.h"
 
 // Top-level controller orchestration lives here after the runtime split.
@@ -309,6 +310,7 @@ void loop2() {
 
 void setup() {
   bool mtp_registered = true;
+  bool capture_registered = true;
   // Bring up status LED first so bare-board bring-up has immediate feedback.
 #if RGB_POWER_ENABLED
   pinMode(RGB_POWER_PIN, OUTPUT);
@@ -332,6 +334,21 @@ void setup() {
     Serial.println("MTP interface registration failed");
   }
   controllerGnssRuntimeInitUsbPassthrough();
+#if defined(USE_TINYUSB)
+  // Register the capture interface after the NMEA CDC so the pre-existing
+  // interface numbers (and host-side port names derived from them) are stable.
+  capture_registered = controllerUsbCaptureBegin();
+  // Reattach so descriptor changes applied in setup() are visible on hosts
+  // that enumerated immediately.
+  if (TinyUSBDevice.mounted()) {
+    TinyUSBDevice.detach();
+    delay(10);
+    TinyUSBDevice.attach();
+  }
+#endif
+  if (!capture_registered) {
+    Serial.println("USB capture interface registration failed");
+  }
   // Give USB a moment to enumerate before the startup burst of status prints.
   delay(2000);
 
@@ -462,6 +479,7 @@ void loop() {
   }
 #endif
   controllerMtpStorageTask();
+  controllerUsbCaptureTask();
   handleResetButton();
 
   // Read GNSS data, update the fix LED, and compute the current "usable fix"

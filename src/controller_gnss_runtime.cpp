@@ -21,14 +21,9 @@ static constexpr uint8_t NMEA_PASSTHROUGH_CDC_INSTANCE = 1;
 
 void controllerGnssRuntimeInitUsbPassthrough() {
 #if defined(USE_TINYUSB)
-  // Reattach after begin() so descriptor changes applied in setup() are visible
-  // on hosts that enumerate immediately.
+  // setup() reattaches USB after all interfaces are registered so hosts that
+  // enumerated early pick up the full descriptor.
   nmea_passthrough_cdc.begin(115200);
-  if (TinyUSBDevice.mounted()) {
-    TinyUSBDevice.detach();
-    delay(10);
-    TinyUSBDevice.attach();
-  }
 #endif
 }
 

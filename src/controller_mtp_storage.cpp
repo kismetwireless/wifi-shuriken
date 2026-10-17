@@ -74,6 +74,15 @@ uint32_t object_handle_capacity = 0;
 MtpObject transfer_object = {};
 FsFile transfer_file;
 
+// Host-to-device object state: SendObjectInfo creates the file and records it
+// here, then the following SendObject streams its contents.
+bool incoming_valid = false;
+uint32_t incoming_handle = 0;
+uint32_t incoming_size = 0;
+uint32_t incoming_written = 0;
+int32_t incoming_result = MTP_RESP_OK;
+uint8_t receive_buffer[CFG_TUD_MTP_EP_BUFSIZE] __attribute__((aligned(4)));
+
 enum class PendingCallback : uint8_t {
   NONE,
   COMMAND,
@@ -83,6 +92,8 @@ enum class PendingCallback : uint8_t {
 
 volatile PendingCallback pending_callback = PendingCallback::NONE;
 tud_mtp_cb_data_t pending_data = {};
+volatile bool pending_complete = false;
+tud_mtp_cb_data_t pending_complete_data = {};
 
 class SdTryLock {
  public:
@@ -103,7 +114,7 @@ using StorageInfo = MTP_STORAGE_INFO_STRUCT(3, 9);
 StorageInfo storage_info = {
     .storage_type = MTP_STORAGE_TYPE_REMOVABLE_RAM,
     .filesystem_type = MTP_FILESYSTEM_TYPE_GENERIC_HIERARCHICAL,
-    .access_capability = MTP_ACCESS_CAPABILITY_READ_ONLY_WITHOUT_OBJECT_DELETION,
+    .access_capability = MTP_ACCESS_CAPABILITY_READ_WRITE,
     .max_capacity_in_bytes = 0,
     .free_space_in_bytes = 0,
     .free_space_in_objects = 0,
@@ -115,6 +126,11 @@ void flushActiveLog() {
   if (mtp_active_log != nullptr && *mtp_active_log) {
     mtp_active_log->flush();
   }
+}
+
+bool isActiveLogHandle(uint32_t handle) {
+  return mtp_active_log != nullptr && *mtp_active_log &&
+         mtp_active_log->dirIndex() + 1 == handle;
 }
 
 void releaseObjectTransferLock() {
@@ -131,6 +147,7 @@ void requestTransferRelease(bool reset_session) {
   if (reset_session) {
     session_reset_requested = true;
     pending_callback = PendingCallback::NONE;
+    pending_complete = false;
   }
   restore_interrupts(irq_state);
 }
@@ -149,6 +166,7 @@ void serviceTransferReleaseRequests() {
   if (reset_session) {
     session_open = false;
     object_count = 0;
+    incoming_valid = false;
   }
 }
 
@@ -444,7 +462,9 @@ int32_t sendObjectInfo(tud_mtp_cb_data_t* cb) {
   const mtp_object_info_header_t info = {
       .storage_id = STORAGE_ID,
       .object_format = object.format,
-      .protection_status = MTP_PROTECTION_STATUS_READ_ONLY,
+      .protection_status = isActiveLogHandle(cb->command_container->params[0])
+                               ? MTP_PROTECTION_STATUS_READ_ONLY
+                               : MTP_PROTECTION_STATUS_NO_PROTECTION,
       .object_compressed_size = object.size,
       .thumb_format = MTP_OBJ_FORMAT_UNDEFINED,
       .thumb_compressed_size = 0,
@@ -528,6 +548,178 @@ int32_t sendObject(tud_mtp_cb_data_t* cb, bool partial) {
   return 0;
 }
 
+// Decode the filename string that follows the ObjectInfo dataset header.
+// Only printable ASCII without path separators is accepted, since objects
+// live flat in the SD root.
+bool parseIncomingName(const uint8_t* data, uint32_t length, char* out, size_t out_len) {
+  if (length < sizeof(mtp_object_info_header_t) + 1) {
+    return false;
+  }
+  const uint8_t* string = data + sizeof(mtp_object_info_header_t);
+  const uint32_t chars = string[0];
+  if (chars < 2 || chars > out_len ||
+      sizeof(mtp_object_info_header_t) + 1 + chars * 2 > length) {
+    return false;
+  }
+  for (uint32_t i = 0; i < chars; ++i) {
+    const uint16_t ch = static_cast<uint16_t>(string[1 + i * 2] | (string[2 + i * 2] << 8));
+    if (i == chars - 1) {
+      out[i] = '\0';
+      return ch == 0;
+    }
+    if (ch < 0x20 || ch > 0x7e || ch == '/' || ch == '\\') {
+      return false;
+    }
+    out[i] = static_cast<char>(ch);
+  }
+  return false;
+}
+
+int32_t createIncomingObject(const uint8_t* data, uint32_t length) {
+  incoming_valid = false;
+  if (length < sizeof(mtp_object_info_header_t)) {
+    return MTP_RESP_INVALID_DATASET;
+  }
+  mtp_object_info_header_t info;
+  memcpy(&info, data, sizeof(info));
+  if (info.object_format == MTP_OBJ_FORMAT_ASSOCIATION) {
+    return MTP_RESP_INVALID_OBJECT_FORMAT_CODE;
+  }
+  if (info.object_compressed_size == UINT32_MAX) {
+    return MTP_RESP_OBJECT_TOO_LARGE;
+  }
+  char name[MAX_NAME_LEN];
+  if (!parseIncomingName(data, length, name, sizeof(name))) {
+    return MTP_RESP_INVALID_DATASET;
+  }
+
+  SdTryLock lock;
+  if (!lock.locked()) {
+    return MTP_RESP_DEVICE_BUSY;
+  }
+  if (mtp_active_log != nullptr && *mtp_active_log) {
+    char active_name[MAX_NAME_LEN];
+    if (mtp_active_log->getName(active_name, sizeof(active_name)) > 0 &&
+        strcasecmp(active_name, name) == 0) {
+      return MTP_RESP_ACCESS_DENIED;
+    }
+  }
+  FsFile root = mtp_sd->open("/", O_RDONLY);
+  if (!root) {
+    return MTP_RESP_STORE_NOT_AVAILABLE;
+  }
+  FsFile file;
+  const bool opened = file.open(&root, name, O_WRONLY | O_CREAT | O_TRUNC);
+  root.close();
+  if (!opened) {
+    return MTP_RESP_ACCESS_DENIED;
+  }
+  incoming_handle = file.dirIndex() + 1;
+  file.close();
+  incoming_size = info.object_compressed_size;
+  incoming_valid = true;
+  return MTP_RESP_OK;
+}
+
+int32_t receiveObjectInfo(tud_mtp_cb_data_t* cb) {
+  if (cb->phase == MTP_PHASE_COMMAND) {
+    if (!storage_ready) {
+      return MTP_RESP_STORE_NOT_AVAILABLE;
+    }
+    if (!validStorageId(cb->command_container->params[0])) {
+      return MTP_RESP_INVALID_STORAGE_ID;
+    }
+    const uint32_t parent = cb->command_container->params[1];
+    if (parent != 0 && parent != UINT32_MAX) {
+      return MTP_RESP_INVALID_PARENT_OBJECT;
+    }
+    incoming_result = MTP_RESP_GENERAL_ERROR;
+    return tud_mtp_data_receive(&cb->io_container) ? 0 : MTP_RESP_DEVICE_BUSY;
+  }
+  // The whole dataset arrives in the first OUT packet.
+  incoming_result = createIncomingObject(cb->io_container.payload, cb->io_container.payload_bytes);
+  return 0;
+}
+
+int32_t receiveObject(tud_mtp_cb_data_t* cb) {
+  if (cb->phase == MTP_PHASE_COMMAND) {
+    if (!incoming_valid) {
+      return MTP_RESP_NO_VALID_OBJECTINFO;
+    }
+    if (object_transfer_locked || !mutex_try_enter(&sd_mutex, nullptr)) {
+      return MTP_RESP_DEVICE_BUSY;
+    }
+    object_transfer_locked = true;
+    incoming_valid = false;
+    incoming_written = 0;
+    incoming_result = MTP_RESP_OK;
+    FsFile root = mtp_sd->open("/", O_RDONLY);
+    const bool opened = root && transfer_file.open(&root, incoming_handle - 1, O_WRONLY);
+    root.close();
+    if (!opened) {
+      releaseObjectTransferLock();
+      return MTP_RESP_INVALID_OBJECT_HANDLE;
+    }
+    cb->io_container.header->len += incoming_size;
+    if (!tud_mtp_data_receive(&cb->io_container)) {
+      releaseObjectTransferLock();
+      cb->io_container.header->len -= incoming_size;
+      return MTP_RESP_DEVICE_BUSY;
+    }
+    return 0;
+  }
+
+  if (!object_transfer_locked) {
+    return 0;
+  }
+  const uint32_t length = std::min(cb->io_container.payload_bytes,
+                                   remainingBytes(incoming_size, incoming_written));
+  if (length > 0 && incoming_result == MTP_RESP_OK) {
+    if (transfer_file.write(cb->io_container.payload, length) != length) {
+      // Keep accepting the data phase so the host gets a clean response.
+      incoming_result = MTP_RESP_STORE_FULL;
+    }
+  }
+  incoming_written += length;
+  const uint32_t expected = sizeof(mtp_container_header_t) + incoming_size;
+  if (cb->total_xferred_bytes < expected && cb->io_container.payload_bytes > 0) {
+    tud_mtp_data_receive(&cb->io_container);
+  }
+  return 0;
+}
+
+int32_t deleteObject(tud_mtp_cb_data_t* cb) {
+  const uint32_t handle = cb->command_container->params[0];
+  if (!storage_ready) {
+    return MTP_RESP_STORE_NOT_AVAILABLE;
+  }
+  if (handle == 0 || handle == UINT32_MAX) {
+    return MTP_RESP_INVALID_OBJECT_HANDLE;
+  }
+  SdTryLock lock;
+  if (!lock.locked()) {
+    return MTP_RESP_DEVICE_BUSY;
+  }
+  if (isActiveLogHandle(handle)) {
+    return MTP_RESP_OBJECT_WRITE_PROTECTED;
+  }
+  FsFile root = mtp_sd->open("/", O_RDONLY);
+  if (!root) {
+    return MTP_RESP_STORE_NOT_AVAILABLE;
+  }
+  FsFile entry;
+  const bool opened = entry.open(&root, handle - 1, O_WRONLY);
+  root.close();
+  if (!opened) {
+    return MTP_RESP_INVALID_OBJECT_HANDLE;
+  }
+  if (entry.isDir()) {
+    entry.close();
+    return MTP_RESP_OBJECT_WRITE_PROTECTED;
+  }
+  return entry.remove() ? MTP_RESP_OK : MTP_RESP_ACCESS_DENIED;
+}
+
 using Handler = int32_t (*)(tud_mtp_cb_data_t*);
 
 Handler findHandler(uint16_t operation) {
@@ -543,6 +735,9 @@ Handler findHandler(uint16_t operation) {
     case MTP_OP_GET_OBJECT_INFO: return sendObjectInfo;
     case MTP_OP_GET_OBJECT: return [](tud_mtp_cb_data_t* cb) { return sendObject(cb, false); };
     case MTP_OP_GET_PARTIAL_OBJECT: return [](tud_mtp_cb_data_t* cb) { return sendObject(cb, true); };
+    case MTP_OP_SEND_OBJECT_INFO: return receiveObjectInfo;
+    case MTP_OP_SEND_OBJECT: return receiveObject;
+    case MTP_OP_DELETE_OBJECT: return deleteObject;
     default: return nullptr;
   }
 }
@@ -558,24 +753,68 @@ int32_t dispatch(tud_mtp_cb_data_t* cb) {
 }
 
 int32_t completeData(tud_mtp_cb_data_t* cb) {
+  const uint16_t operation = cb->command_container->header.code;
+  if (operation == MTP_OP_SEND_OBJECT && object_transfer_locked) {
+    if (!transfer_file.sync() && incoming_result == MTP_RESP_OK) {
+      incoming_result = MTP_RESP_STORE_FULL;
+    }
+    if (incoming_written != incoming_size && incoming_result == MTP_RESP_OK) {
+      incoming_result = MTP_RESP_INCOMPLETE_TRANSFER;
+    }
+  }
   releaseObjectTransferLock();
   mtp_container_info_t* response = &cb->io_container;
-  if (cb->command_container->header.code == MTP_OP_GET_PARTIAL_OBJECT) {
+  uint16_t code = cb->xfer_result == XFER_RESULT_SUCCESS ? MTP_RESP_OK : MTP_RESP_GENERAL_ERROR;
+  if (operation == MTP_OP_GET_PARTIAL_OBJECT) {
     const uint32_t bytes = cb->total_xferred_bytes - sizeof(mtp_container_header_t);
     mtp_container_add_uint32(response, bytes);
+  } else if (operation == MTP_OP_SEND_OBJECT_INFO || operation == MTP_OP_SEND_OBJECT) {
+    if (code == MTP_RESP_OK) {
+      code = static_cast<uint16_t>(incoming_result);
+    }
+    if (operation == MTP_OP_SEND_OBJECT_INFO && code == MTP_RESP_OK) {
+      mtp_container_add_uint32(response, STORAGE_ID);
+      mtp_container_add_uint32(response, cb->command_container->params[1]);
+      mtp_container_add_uint32(response, incoming_handle);
+    }
   }
-  response->header->code = cb->xfer_result == XFER_RESULT_SUCCESS
-                              ? MTP_RESP_OK
-                              : MTP_RESP_GENERAL_ERROR;
+  response->header->code = code;
   tud_mtp_response_send(response);
   return 0;
 }
 
+// Host-to-device data arrives in the shared endpoint buffer, and the stack
+// rewrites that buffer's first word before the deferred handler runs when the
+// last OUT packet also completes the data phase. Copy it out while still in the
+// stack callback.
+void captureOutPayload(tud_mtp_cb_data_t* cb) {
+  const uint16_t operation = cb->command_container->header.code;
+  if (operation != MTP_OP_SEND_OBJECT && operation != MTP_OP_SEND_OBJECT_INFO) {
+    return;
+  }
+  const uint32_t length = std::min<uint32_t>(cb->io_container.payload_bytes,
+                                             sizeof(receive_buffer));
+  memcpy(receive_buffer, cb->io_container.payload, length);
+  pending_data.io_container.payload = receive_buffer;
+  pending_data.io_container.payload_bytes = length;
+}
+
 int32_t deferCallback(PendingCallback callback, tud_mtp_cb_data_t* cb) {
   if (pending_callback != PendingCallback::NONE) {
-    return -1;
+    // The final OUT packet raises the data and completion callbacks back to
+    // back; queue the completion behind the data so neither is lost.
+    if (callback != PendingCallback::DATA_COMPLETE || pending_complete) {
+      return -1;
+    }
+    pending_complete_data = *cb;
+    __compiler_memory_barrier();
+    pending_complete = true;
+    return 0;
   }
   pending_data = *cb;
+  if (callback == PendingCallback::DATA) {
+    captureOutPayload(cb);
+  }
   __compiler_memory_barrier();
   pending_callback = callback;
   return 0;
@@ -607,7 +846,6 @@ void controllerMtpStorageTask() {
     return;
   }
   tud_mtp_cb_data_t data = pending_data;
-  pending_callback = PendingCallback::NONE;
   restore_interrupts(irq_state);
 
   mutex_enter_blocking(&__usb_mutex);
@@ -615,6 +853,21 @@ void controllerMtpStorageTask() {
     dispatch(&data);
   } else if (callback == PendingCallback::DATA_COMPLETE) {
     completeData(&data);
+  }
+  // Keep the primary slot occupied until the handler finishes so a queued
+  // completion for the same transfer is always processed after its data.
+  tud_mtp_cb_data_t complete_data = {};
+  bool run_complete = false;
+  const uint32_t irq_state2 = save_and_disable_interrupts();
+  pending_callback = PendingCallback::NONE;
+  if (pending_complete) {
+    complete_data = pending_complete_data;
+    pending_complete = false;
+    run_complete = true;
+  }
+  restore_interrupts(irq_state2);
+  if (run_complete) {
+    completeData(&complete_data);
   }
   mutex_exit(&__usb_mutex);
   TinyUSB_Device_Task();
