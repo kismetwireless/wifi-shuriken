@@ -13,6 +13,7 @@
 #include "pico/time.h"
 #include "channel_scheduler.h"
 #include "controller_usb_capture.h"
+#include "dot11_filter.h"
 #include "pico/critical_section.h"
 #include "pico_logging.h"
 #include "spi_protocol_shared.h"
@@ -1758,7 +1759,31 @@ struct MonitorSlotState {
   // an unchanged slot is not restarted when another slot is retuned.
   ControllerMonitorSlotConfig applied_cfg;
   uint32_t scanner_ring_drops;
+  // Controller-side frame filter, updated on every request without restarting
+  // the scanner.
+  uint8_t filter_types;  // DOT11_TYPE_* passed to USB.
+  uint8_t data_mode;     // Dot11DataMode.
 };
+
+// Frame filter totals since the last console report (core1 only).
+struct FilterStats {
+  uint32_t frames;
+  uint32_t by_class[DOT11_CLASS_COUNT];
+  uint32_t dropped;
+  uint32_t truncated;
+  uint32_t bytes_in;
+  uint32_t bytes_out;
+  // Time spent classifying and filtering, and handing batches to USB in all.
+  uint32_t filter_us;
+  uint32_t deliver_us;
+};
+
+// Most records a batch can hold (each needs at least its record header).
+static constexpr uint16_t PKT_BATCH_MAX_RECORDS =
+    (PKT_BATCH_MAX_BYTES - sizeof(PktBatchHeader)) / sizeof(MonitorPacketRecord);
+
+static FilterStats filter_stats = {};
+static constexpr uint32_t FILTER_REPORT_INTERVAL_MS = 10000;
 
 static MonitorSlotState monitor_slots[SCANNER_SLOT_COUNT] = {};
 
@@ -2016,14 +2041,58 @@ static void pktCheckSyntheticSequence(MonitorSlotState& state, uint16_t record_b
   }
 }
 
-// Hand every record of a validated batch to the USB capture ring.
+// Hand every record of a validated batch to the USB capture ring, filtered by
+// the slot's frame types and data mode.
 static void pktDeliverToUsb(const MonitorSlotState& state, uint16_t record_bytes) {
+  const uint32_t start_us = time_us_32();
   const uint8_t slot = static_cast<uint8_t>(&state - monitor_slots);
   const uint8_t* records = pkt_bulk_rx + sizeof(PktBatchHeader);
+
+  // Filter the whole batch first so the console report can time it apart
+  // from the USB ring writes.
+  static Dot11FilterResult results[PKT_BATCH_MAX_RECORDS];
+  uint16_t count = 0;
   uint32_t offset = 0;
-  while (offset + sizeof(MonitorPacketRecord) <= record_bytes) {
+  while (offset + sizeof(MonitorPacketRecord) <= record_bytes && count < PKT_BATCH_MAX_RECORDS) {
     MonitorPacketRecord rec;
     memcpy(&rec, records + offset, sizeof(rec));
+    const uint16_t cap_len = static_cast<uint16_t>(rec.record_len - sizeof(rec));
+    if (rec.flags & MONITOR_PKT_FLAG_SYNTHETIC) {
+      // Synthetic records are transport tests, not 802.11 frames.
+      results[count] = {DOT11_CLASS_MALFORMED, DOT11_ACTION_PASS, cap_len};
+    } else {
+      results[count] = dot11Filter(records + offset + sizeof(rec), cap_len, state.filter_types,
+                                   state.data_mode);
+    }
+    count++;
+    offset += rec.record_len;
+  }
+  filter_stats.filter_us += time_us_32() - start_us;
+
+  offset = 0;
+  for (uint16_t i = 0; i < count; i++) {
+    MonitorPacketRecord rec;
+    memcpy(&rec, records + offset, sizeof(rec));
+    const uint8_t* frame = records + offset + sizeof(rec);
+    uint16_t cap_len = static_cast<uint16_t>(rec.record_len - sizeof(rec));
+    offset += rec.record_len;
+    bool truncated = false;
+    filter_stats.frames++;
+    filter_stats.bytes_in += cap_len;
+    if (!(rec.flags & MONITOR_PKT_FLAG_SYNTHETIC)) {
+      const Dot11FilterResult& filtered = results[i];
+      filter_stats.by_class[filtered.cls]++;
+      if (filtered.action == DOT11_ACTION_DROP) {
+        filter_stats.dropped++;
+        continue;
+      }
+      if (filtered.action == DOT11_ACTION_TRUNCATE) {
+        filter_stats.truncated++;
+        cap_len = filtered.cap_len;
+        truncated = true;
+      }
+    }
+    filter_stats.bytes_out += cap_len;
     UsbCapturePacketHeader hdr = {};
     hdr.slot = slot;
     hdr.band = rec.band;
@@ -2032,16 +2101,52 @@ static void pktDeliverToUsb(const MonitorSlotState& state, uint16_t record_bytes
     hdr.noise = rec.noise;
     hdr.rate = rec.rate;
     hdr.sig_mode = rec.sig_mode;
-    if (rec.flags & MONITOR_PKT_FLAG_FCS_INCLUDED) hdr.flags |= USB_CAPTURE_PKT_FCS_INCLUDED;
-    if (rec.flags & MONITOR_PKT_FLAG_TRUNCATED) hdr.flags |= USB_CAPTURE_PKT_TRUNCATED;
+    // Cutting the frame also cuts off any FCS.
+    if ((rec.flags & MONITOR_PKT_FLAG_FCS_INCLUDED) && !truncated) {
+      hdr.flags |= USB_CAPTURE_PKT_FCS_INCLUDED;
+    }
+    if ((rec.flags & MONITOR_PKT_FLAG_TRUNCATED) || truncated) {
+      hdr.flags |= USB_CAPTURE_PKT_TRUNCATED;
+    }
     if (rec.flags & MONITOR_PKT_FLAG_SYNTHETIC) hdr.flags |= USB_CAPTURE_PKT_SYNTHETIC;
     hdr.radio_timestamp_us = rec.timestamp_us;
     hdr.orig_len = rec.orig_len;
-    hdr.cap_len = static_cast<uint16_t>(rec.record_len - sizeof(rec));
+    hdr.cap_len = cap_len;
     // Ring overflow is counted by the capture layer; never block here.
-    controllerUsbCaptureQueuePacket(hdr, records + offset + sizeof(rec));
-    offset += rec.record_len;
+    controllerUsbCaptureQueuePacket(hdr, frame);
   }
+  filter_stats.deliver_us += time_us_32() - start_us;
+}
+
+static const char* const kDot11DataModeNames[DOT11_DATA_MODE_COUNT] = {
+    "pass-all", "truncate-all", "pass-open", "handshake"};
+
+// Console summary of what the frame filter did since the last report.
+static void filterReport(uint32_t interval_ms) {
+  FilterStats& st = filter_stats;
+  if (st.frames == 0) {
+    return;
+  }
+  const uint32_t filter_ns =
+      static_cast<uint32_t>(static_cast<uint64_t>(st.filter_us) * 1000u / st.frames);
+  const uint32_t deliver_ns =
+      static_cast<uint32_t>(static_cast<uint64_t>(st.deliver_us) * 1000u / st.frames);
+  scannerSerialPrintfTry(
+      "Filter %lus: %lu frames %lu->%lu KiB; mgmt %lu ctrl %lu null %lu open %lu prot %lu "
+      "eapol %lu other %lu; drop %lu trunc %lu; filter %lu us %lu ns/f, deliver %lu us %lu ns/f\n",
+      static_cast<unsigned long>(interval_ms / 1000), static_cast<unsigned long>(st.frames),
+      static_cast<unsigned long>(st.bytes_in / 1024), static_cast<unsigned long>(st.bytes_out / 1024),
+      static_cast<unsigned long>(st.by_class[DOT11_CLASS_MGMT] + st.by_class[DOT11_CLASS_EXTENSION]),
+      static_cast<unsigned long>(st.by_class[DOT11_CLASS_CTRL]),
+      static_cast<unsigned long>(st.by_class[DOT11_CLASS_DATA_NULL]),
+      static_cast<unsigned long>(st.by_class[DOT11_CLASS_DATA_OPEN]),
+      static_cast<unsigned long>(st.by_class[DOT11_CLASS_DATA_PROTECTED]),
+      static_cast<unsigned long>(st.by_class[DOT11_CLASS_DATA_EAPOL]),
+      static_cast<unsigned long>(st.by_class[DOT11_CLASS_MALFORMED]),
+      static_cast<unsigned long>(st.dropped), static_cast<unsigned long>(st.truncated),
+      static_cast<unsigned long>(st.filter_us), static_cast<unsigned long>(filter_ns),
+      static_cast<unsigned long>(st.deliver_us), static_cast<unsigned long>(deliver_ns));
+  st = {};
 }
 
 // Clock the bulk read for a reply already in hand and account for it.
@@ -2579,6 +2684,7 @@ static void monitorLinkApply(const ControllerMonitorRequest& request, uint32_t n
     // New session: hop boundaries are counted from here. Slots configured
     // later in this pass join the schedule at their current position.
     monitor_hop_epoch_ms = now_ms;
+    filter_stats = {};
   }
   uint8_t wanted = 0;
   uint8_t capturing = 0;
@@ -2606,6 +2712,8 @@ static void monitorLinkApply(const ControllerMonitorRequest& request, uint32_t n
       continue;
     }
     const ControllerMonitorSlotConfig& cfg = request.slot[slot];
+    state.filter_types = cfg.type_mask;
+    state.data_mode = cfg.data_mode < DOT11_DATA_MODE_COUNT ? cfg.data_mode : DOT11_DATA_PASS_ALL;
     if (state.monitoring && monitorSlotConfigEqual(state.applied_cfg, cfg)) {
       capturing++;
       continue;
@@ -2658,9 +2766,17 @@ static void monitorLinkApply(const ControllerMonitorRequest& request, uint32_t n
   const bool was_streaming = monitor_link_streaming;
   monitor_link_streaming = request.active;
   if (request.active) {
+    uint8_t first = 0;
+    while (first < CONTROLLER_MONITOR_MAX_SLOTS - 1 && !(request.slot_mask & (1u << first))) {
+      first++;
+    }
+    const ControllerMonitorSlotConfig& shown = request.slot[first];
     scannerSerialPrintfTry(
-        "Monitor capture: %u of %u requested slots capturing (%u restarted); CSV logging paused\n",
-        capturing, wanted, restarted);
+        "Monitor capture: %u of %u requested slots capturing (%u restarted); CSV logging paused; "
+        "filter S%u ctrl %s, data %s\n",
+        capturing, wanted, restarted, first,
+        (shown.type_mask & DOT11_TYPE_CTRL) ? "pass" : "filter",
+        kDot11DataModeNames[shown.data_mode < DOT11_DATA_MODE_COUNT ? shown.data_mode : 0]);
   } else if (was_streaming) {
     // Scanning re-identifies every slot, which also clears any leftover
     // capture state on the scanner side.
@@ -2677,6 +2793,7 @@ static void monitorLinkApply(const ControllerMonitorRequest& request, uint32_t n
 // scanners (the scan scheduler must not run).
 static bool monitorLinkService() {
   static uint32_t next_publish_ms = 0;
+  static uint32_t next_filter_report_ms = 0;
   const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
   if (monitor_link_generation != monitor_link_applied_generation) {
     // ~1.2 KB with hop lists: keep it off core1's small stack.
@@ -2697,6 +2814,12 @@ static bool monitorLinkService() {
   if ((int32_t)(now_ms - next_publish_ms) >= 0) {
     monitorLinkPublish();
     next_publish_ms = now_ms + MONITOR_LINK_STATUS_INTERVAL_MS;
+  }
+  if ((int32_t)(now_ms - next_filter_report_ms) >= 0) {
+    if (next_filter_report_ms != 0) {
+      filterReport(FILTER_REPORT_INTERVAL_MS);
+    }
+    next_filter_report_ms = now_ms + FILTER_REPORT_INTERVAL_MS;
   }
   return true;
 }

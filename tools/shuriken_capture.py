@@ -17,6 +17,13 @@ slots unless --no-stagger):
     tools/shuriken_capture.py -w out.pcap --split --hop 1,6,11,36,40,48,161 --dwell 200
     tools/shuriken_capture.py -w out.pcap --split --types mgmt,data
 
+The controller decodes each frame on its way to USB. Control frames are
+dropped unless --ctrl pass, and --data picks how data frames are trimmed
+(default handshake: EAPOL whole, every other data frame cut to its header):
+
+    tools/shuriken_capture.py -w out.pcap --ctrl pass --data open
+    tools/shuriken_capture.py -w out.pcap --data pass
+
 A .pcapng output (or --pcapng) declares one capture interface per radio,
 named shuriken01..shuriken06, so each packet shows which radio heard it:
 
@@ -81,6 +88,15 @@ FILTER_MGMT = 1 << 0
 FILTER_CTRL = 1 << 1
 FILTER_DATA = 1 << 2
 FILTER_FCS_FAIL = 1 << 3
+
+# SET_FILTER data_mode: how the controller trims data frames. Trimmed frames
+# keep their original length, so the pcap records them as truncated.
+DATA_MODES = {
+    "pass": 0,       # every data frame whole
+    "truncate": 1,   # every data frame cut to its 802.11 header
+    "open": 2,       # unencrypted whole, encrypted cut to the header
+    "handshake": 3,  # EAPOL (WPA handshakes) whole, everything else cut
+}
 
 PKT_FCS_INCLUDED = 1 << 0
 PKT_TRUNCATED = 1 << 1
@@ -474,9 +490,18 @@ def main():
                     help="start every slot at the same hop index")
     ap.add_argument("--types", default="mgmt,data",
                     help="frame types to capture: mgmt,ctrl,data,fcsfail (default mgmt,data)")
+    ap.add_argument("--ctrl", choices=("filter", "pass"), default="filter",
+                    help="pass or filter control frames (default filter; same as "
+                         "adding ctrl to --types)")
+    ap.add_argument("--data", choices=tuple(DATA_MODES), default="handshake",
+                    help="data frames: pass = all whole, truncate = all cut to the "
+                         "802.11 header, open = unencrypted whole and encrypted cut, "
+                         "handshake = WPA handshakes whole and the rest cut "
+                         "(default handshake)")
     ap.add_argument("--snaplen-mgmt", type=int, default=0)
     ap.add_argument("--snaplen-ctrl", type=int, default=0)
-    ap.add_argument("--snaplen-data", type=int, default=256)
+    ap.add_argument("--snaplen-data", type=int, default=0,
+                    help="cap on data frame length before --data applies (default 0: none)")
     ap.add_argument("--synthetic", type=int, metavar="PPS",
                     help="run the controller's synthetic beacon generator at PPS")
     ap.add_argument("--synthetic-len", type=int, default=200,
@@ -525,9 +550,11 @@ def main():
         if name.strip() not in type_bits:
             ap.error("unknown frame type %r" % name)
         type_mask |= type_bits[name.strip()]
+    if args.ctrl == "pass":
+        type_mask |= FILTER_CTRL
     dev.checked("SET_FILTER", CMD_SET_FILTER, struct.pack(
-        "<BBHHH", slot_mask, type_mask, args.snaplen_mgmt, args.snaplen_ctrl,
-        args.snaplen_data))
+        "<BBHHHB3x", slot_mask, type_mask, args.snaplen_mgmt, args.snaplen_ctrl,
+        args.snaplen_data, DATA_MODES[args.data]))
 
     if args.channel is not None:
         dev.checked("SET_CHANNEL", CMD_SET_CHANNEL, struct.pack(
@@ -559,7 +586,7 @@ def main():
                 writers[key] = PcapWriter(path)
         return writers[key]
 
-    stats = dict(packets=0, bytes=0, seq_gaps=0, last_status=None)
+    stats = dict(packets=0, bytes=0, truncated=0, seq_gaps=0, last_status=None)
     clock = dict(host0=None, ctrl0=None)
     expected_seq = [None]
 
@@ -576,6 +603,8 @@ def main():
             writer_for(pkt["slot"]).write(ts, pkt, frame)
             stats["packets"] += 1
             stats["bytes"] += len(body)
+            if pkt["flags"] & PKT_TRUNCATED:
+                stats["truncated"] += 1
         elif rtype == REC_STATUS:
             stats["last_status"] = parse_status(body)
 
@@ -632,9 +661,11 @@ def main():
 
     elapsed = time.monotonic() - started
     st = stats["last_status"] or {}
-    print("captured %d packets in %.1fs (%.1f pkt/s), ring drops=%s, seq gaps=%d" % (
-        stats["packets"], elapsed, stats["packets"] / elapsed if elapsed else 0,
-        st.get("ring_drop_records", "?"), stats["seq_gaps"]), file=sys.stderr)
+    print("captured %d packets (%d truncated) in %.1fs (%.1f pkt/s), ring drops=%s, "
+          "seq gaps=%d" % (
+              stats["packets"], stats["truncated"], elapsed,
+              stats["packets"] / elapsed if elapsed else 0,
+              st.get("ring_drop_records", "?"), stats["seq_gaps"]), file=sys.stderr)
 
 
 if __name__ == "__main__":

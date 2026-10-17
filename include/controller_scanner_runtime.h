@@ -67,6 +67,9 @@ struct ControllerMonitorSlotConfig {
   uint16_t snaplen_mgmt;
   uint16_t snaplen_ctrl;
   uint16_t snaplen_data;
+  // Dot11DataMode the controller applies to data frames on their way to USB.
+  // Changing only this leaves the scanner capturing.
+  uint8_t data_mode;
   // When hopping, the scanner retunes through hop[] every hop_dwell_ms on its
   // own, starting at hop_offset; band/channel are then ignored.
   bool hopping;

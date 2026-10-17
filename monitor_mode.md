@@ -63,7 +63,7 @@ reply record echoing its sequence number and a status byte.
 | `HELLO` (0x01) | Starts a fresh host session: stops any session a previous host left running, drops queued output, and **restores every slot's default channel, hop and filter settings**. Replies with `UsbCaptureInfo` (slot count, max packet size, capabilities). |
 | `SET_CHANNEL` (0x05) | Fixed channel for the slots in `slot_mask`; clears hopping on them. |
 | `SET_HOP` (0x06) | Hop list (≤ 64 entries) and dwell (≥ 10 ms) for the slots in `slot_mask`. With `USB_CAPTURE_HOP_STAGGER`, each slot starts at a different point in the list. |
-| `SET_FILTER` (0x07) | Frame types (mgmt/ctrl/data) and per-type snaplen (0 = whole frame). The `FCS_FAIL` bit is ignored for radio capture; scanners only deliver frames received intact. |
+| `SET_FILTER` (0x07) | Frame types (mgmt/ctrl/data), per-type snaplen (0 = whole frame) and the data mode (see [Frame filter](#frame-filter)). The 8-byte form without `data_mode` selects the default mode. The `FCS_FAIL` bit is ignored for radio capture; scanners only deliver frames received intact. |
 | `START` (0x02) | Without `USB_CAPTURE_START_SYNTHETIC`: radio capture on the slots in `slot_mask`. With it: synthetic capture. |
 | `KEEPALIVE` (0x04) | Must arrive (or any other command) at least every 5 s while a session runs. |
 | `GET_STATUS` (0x08) | Replies, then queues a status record immediately. |
@@ -71,7 +71,8 @@ reply record echoing its sequence number and a status byte.
 | `STOP` (0x03) | Ends the session; the device returns to scanning. |
 
 Defaults after `HELLO`: slots on channels 1, 6, 11, 36, 44, 149; management and
-data frames; data snaplen 256; no hopping.
+data frames (control frames filtered); no snaplen; data mode `PASS_HANDSHAKE`;
+no hopping.
 
 ### What ends a radio session
 
@@ -114,7 +115,70 @@ counters are per session (reported against a baseline taken at `START`).
 `SET_CHANNEL`, `SET_HOP` and `SET_FILTER` during a radio session take effect
 without stopping it. Only slots whose settings changed are restarted; the
 others keep capturing undisturbed. A retuned slot delivers its first frame on
-the new channel within ~0.05–0.2 s.
+the new channel within ~0.05–0.2 s. A data mode change alone applies on the
+controller without restarting the scanner, except switching into or out of
+`TRUNCATE_ALL`, which changes the scanner's data snaplen.
+
+### Frame filter
+
+The controller decodes every captured frame on its way to USB (on core1, in
+the batch delivery loop) and classifies it as management, control, null data,
+unencrypted data, encrypted (protected) data, or EAPOL. EAPOL means
+unencrypted data with an LLC/SNAP header for ethertype 0x888E, which carries
+the WPA 4-way handshake. Frames of a type missing from the type mask are
+dropped; the scanner also filters by type at the radio, so this is a backstop.
+Data frames are then trimmed according to `data_mode`:
+
+| `data_mode` | Unencrypted data | Encrypted data | EAPOL |
+|---|---|---|---|
+| `PASS_ALL` (0) | whole | whole | whole |
+| `TRUNCATE_ALL` (1) | header | header | header |
+| `PASS_OPEN` (2) | whole | header | whole |
+| `PASS_HANDSHAKE` (3, default) | header | header | whole |
+
+"Header" is the 802.11 MAC header: 24 bytes, plus 6 for a fourth address,
+2 for QoS control and 4 for HT control. A trimmed frame keeps its original
+length in `orig_len` and sets `USB_CAPTURE_PKT_TRUNCATED`, so the pcap records
+it as truncated rather than as a short frame. Trimming also drops any FCS.
+Null data frames are header-only already, and management frames are never
+trimmed. A frame too short to hold its own header is passed unchanged.
+
+Classifying EAPOL needs the LLC header, so every mode except `TRUNCATE_ALL`
+pulls whole data frames (up to the host's data snaplen) over SPI. In
+`TRUNCATE_ALL` the controller caps the scanner's data snaplen at 36 bytes,
+the longest data header, which saves SPI bandwidth.
+
+The controller prints a summary on the console every 10 s while capturing:
+
+```
+Filter 10s: 5729 frames 1627->1601 KiB; mgmt 5018 ctrl 0 null 426 open 251 prot 34 eapol 0 other 0; drop 0 trunc 285; filter 13674 us 2386 ns/f, deliver 181920 us 31754 ns/f
+```
+
+`filter` is core1's time classifying and filtering; `deliver` is all of its
+time handing batches to the USB ring, filtering included.
+
+#### Filter cost
+
+Measured on the RP2350 at 150 MHz. The `xiao_rp2350_dot11_bench` env is a
+standalone firmware that times `dot11Filter()` plus the copy into a buffer
+over a fixed frame mix. Times are ns per frame:
+
+| Frame | Classify | Copy | Filter+copy, `PASS_ALL` | Filter+copy, header kept |
+|---|---|---|---|---|
+| beacon 300 B | 229 | 2060 | 2654 | — |
+| ack 10 B (dropped) | 240 | 346 | 681 | — |
+| open data 600 B | 581 | 3626 | 4626 | 1553 |
+| protected data 1500 B | 353 | 8613 | 9354 | 1293 |
+| EAPOL 155 B | 588 | 1186 | 2200 | 1566 |
+
+Classifying costs 0.2–0.6 µs per frame. Trimming a data frame saves more copy
+time than classifying costs. On a mixed set of frames (597 B average), the
+cost per frame is 4.4 µs for `PASS_ALL` and 1.7 µs for `PASS_HANDSHAKE`.
+
+Live, with six radios on busy channels, the filter took 1.3–2.5 µs per frame
+and the whole hand-off to USB took 15–32 µs per frame, nearly all of it the
+USB ring write. At the ~900 KiB/s SPI ceiling the filter uses well under 1% of
+core1. No ring drops or sequence gaps occurred in any mode.
 
 ## Controller: core0 → core1 hand-off
 
@@ -158,7 +222,7 @@ scanning resumes, new results are logged as usual (still subject to the normal
 dedupe). The console reports both transitions:
 
 ```
-Monitor capture: 6 of 6 requested slots capturing (6 restarted); CSV logging paused
+Monitor capture: 6 of 6 requested slots capturing (6 restarted); CSV logging paused; filter S0 ctrl filter, data handshake
 Monitor capture stopped; scanning and CSV logging resumed
 ```
 
@@ -287,7 +351,7 @@ tunes 20 MHz.
 
 ```
 HELLO                                   -> OK, info (6 slots, caps: synthetic, monitor, hop)
-SET_FILTER  slots=0x3f  mgmt+data, data snaplen 256
+SET_FILTER  slots=0x3f  mgmt+data, no snaplen, data PASS_HANDSHAKE
 SET_HOP     slots=0x3f  stagger, dwell 200 ms, [1 6 11 36 40 48 161]
 START       slots=0x3f                  -> OK
   ... packet records, status record every 1 s, KEEPALIVE every 1 s ...
@@ -301,7 +365,12 @@ With the reference tool:
 tools/shuriken_capture.py --radio-info
 tools/shuriken_capture.py -w out.pcap --split --hop 1,6,11,36,40,48,161 --dwell 200
 tools/shuriken_capture.py -w - | tshark -i - -l
+tools/shuriken_capture.py -w out.pcap --ctrl pass --data open
 ```
+
+`--ctrl pass|filter` (default `filter`) passes or drops control frames, and
+`--data pass|truncate|open|handshake` (default `handshake`) selects the data
+mode.
 
 A `.pcapng` output (or `--pcapng`) declares one capture interface per radio,
 named `shuriken01` … `shuriken06`, so each packet records which radio heard it

@@ -72,6 +72,17 @@ static constexpr uint8_t USB_CAPTURE_FILTER_CTRL = (1u << 1);
 static constexpr uint8_t USB_CAPTURE_FILTER_DATA = (1u << 2);
 static constexpr uint8_t USB_CAPTURE_FILTER_FCS_FAIL = (1u << 3);
 
+// UsbCaptureSetFilterCommand.data_mode: how the controller trims data frames.
+// Truncated frames keep orig_len and set USB_CAPTURE_PKT_TRUNCATED, so a pcap
+// records them as cut short rather than as short frames.
+enum UsbCaptureDataMode : uint8_t {
+  USB_CAPTURE_DATA_PASS_ALL = 0,        // Every data frame whole.
+  USB_CAPTURE_DATA_TRUNCATE_ALL = 1,    // Every data frame cut to its 802.11 header.
+  USB_CAPTURE_DATA_PASS_OPEN = 2,       // Unprotected whole, protected cut to the header.
+  USB_CAPTURE_DATA_PASS_HANDSHAKE = 3,  // EAPOL (WPA handshakes) whole, the rest cut.
+};
+static constexpr uint8_t USB_CAPTURE_DATA_MODE_DEFAULT = USB_CAPTURE_DATA_PASS_HANDSHAKE;
+
 // UsbCapturePacketHeader.flags.
 static constexpr uint8_t USB_CAPTURE_PKT_FCS_INCLUDED = (1u << 0);
 static constexpr uint8_t USB_CAPTURE_PKT_TRUNCATED = (1u << 1);
@@ -148,14 +159,19 @@ struct __attribute__((packed)) UsbCaptureSetHopCommand {
   uint8_t reserved[3];
 };
 
-// A snaplen of 0 captures the whole frame.
+// A snaplen of 0 captures the whole frame; data_mode applies within it. The
+// 8-byte form without data_mode (protocol 1 hosts) selects
+// USB_CAPTURE_DATA_MODE_DEFAULT.
 struct __attribute__((packed)) UsbCaptureSetFilterCommand {
   uint8_t slot_mask;
   uint8_t type_mask;
   uint16_t snaplen_mgmt;
   uint16_t snaplen_ctrl;
   uint16_t snaplen_data;
+  uint8_t data_mode;
+  uint8_t reserved[3];
 };
+static constexpr uint16_t USB_CAPTURE_SET_FILTER_V1_BYTES = 8;
 
 // ---- Device records ----
 
@@ -269,7 +285,7 @@ static_assert(sizeof(UsbCaptureStartCommand) == 8, "UsbCaptureStartCommand must 
 static_assert(sizeof(UsbCaptureSetChannelCommand) == 4, "UsbCaptureSetChannelCommand must be 4 bytes");
 static_assert(sizeof(UsbCaptureHopEntry) == 2, "UsbCaptureHopEntry must be 2 bytes");
 static_assert(sizeof(UsbCaptureSetHopCommand) == 8, "UsbCaptureSetHopCommand must be 8 bytes");
-static_assert(sizeof(UsbCaptureSetFilterCommand) == 8, "UsbCaptureSetFilterCommand must be 8 bytes");
+static_assert(sizeof(UsbCaptureSetFilterCommand) == 12, "UsbCaptureSetFilterCommand must be 12 bytes");
 static_assert(sizeof(UsbCaptureReplyHeader) == 4, "UsbCaptureReplyHeader must be 4 bytes");
 static_assert(sizeof(UsbCaptureInfo) == 24, "UsbCaptureInfo must be 24 bytes");
 static_assert(sizeof(UsbCapturePacketHeader) == 24, "UsbCapturePacketHeader must be 24 bytes");

@@ -11,6 +11,7 @@
 #include "capture_ring.h"
 #include "class/vendor/vendor_device.h"
 #include "controller_scanner_runtime.h"
+#include "dot11_filter.h"
 #include "radio_channels.h"
 #include "spi_protocol_shared.h"
 
@@ -42,6 +43,12 @@ static_assert(RADIO_CHAN_WIDTH_20 == USB_CAPTURE_CHAN_20 &&
                   RADIO_CHAN_WIDTH_40_BELOW == USB_CAPTURE_CHAN_40_BELOW &&
                   RADIO_CHAN_WIDTH_80 == USB_CAPTURE_CHAN_80,
               "Radio and USB per-channel width bits must match");
+static_assert(DOT11_DATA_PASS_ALL == USB_CAPTURE_DATA_PASS_ALL &&
+                  DOT11_DATA_TRUNCATE_ALL == USB_CAPTURE_DATA_TRUNCATE_ALL &&
+                  DOT11_DATA_PASS_OPEN == USB_CAPTURE_DATA_PASS_OPEN &&
+                  DOT11_DATA_PASS_HANDSHAKE == USB_CAPTURE_DATA_PASS_HANDSHAKE &&
+                  DOT11_DATA_MODE_COUNT == USB_CAPTURE_DATA_PASS_HANDSHAKE + 1,
+              "Frame filter and USB data modes must match");
 static_assert(RADIO_BAND_24GHZ == USB_CAPTURE_BAND_24GHZ && RADIO_BAND_5GHZ == USB_CAPTURE_BAND_5GHZ,
               "Radio and USB band values must match");
 
@@ -57,7 +64,8 @@ constexpr uint16_t HOP_MIN_DWELL_MS = 10;
 
 // Default per-slot channels until the host configures them.
 constexpr uint8_t DEFAULT_CHANNELS[USB_CAPTURE_MAX_SLOTS] = {1, 6, 11, 36, 44, 149, 157, 165};
-constexpr uint16_t DEFAULT_SNAPLEN_DATA = 256;
+// Whole data frames by default: the data mode does the trimming.
+constexpr uint16_t DEFAULT_SNAPLEN_DATA = 0;
 
 class UsbCaptureInterface : public Adafruit_USBD_Interface {
  public:
@@ -103,6 +111,7 @@ struct SlotConfig {
   uint16_t snaplen_mgmt;
   uint16_t snaplen_ctrl;
   uint16_t snaplen_data;
+  uint8_t data_mode;
 };
 
 struct __attribute__((packed)) PacketRecordPrefix {
@@ -214,6 +223,7 @@ void resetSlotDefaults() {
     cfg.band = (cfg.channel <= 14) ? USB_CAPTURE_BAND_24GHZ : USB_CAPTURE_BAND_5GHZ;
     cfg.type_mask = USB_CAPTURE_FILTER_MGMT | USB_CAPTURE_FILTER_DATA;
     cfg.snaplen_data = DEFAULT_SNAPLEN_DATA;
+    cfg.data_mode = USB_CAPTURE_DATA_MODE_DEFAULT;
   }
 }
 
@@ -320,7 +330,10 @@ void publishRadioRequest(bool active) {
     out.type_mask = cfg.type_mask & (MONITOR_TYPE_MGMT | MONITOR_TYPE_CTRL | MONITOR_TYPE_DATA);
     out.snaplen_mgmt = cfg.snaplen_mgmt;
     out.snaplen_ctrl = cfg.snaplen_ctrl;
-    out.snaplen_data = cfg.snaplen_data;
+    // Trimming every data frame to its header needs no more than the longest
+    // header from the scanner, which saves SPI bandwidth.
+    out.snaplen_data = dot11ScannerDataSnaplen(cfg.data_mode, cfg.snaplen_data);
+    out.data_mode = cfg.data_mode;
     out.hopping = cfg.hopping && cfg.hop_count > 0;
     if (out.hopping) {
       out.hop_count = cfg.hop_count > CONTROLLER_MONITOR_MAX_HOP ? CONTROLLER_MONITOR_MAX_HOP
@@ -613,12 +626,15 @@ int8_t handleSetHop(const uint8_t* body, uint16_t len) {
 
 int8_t handleSetFilter(const uint8_t* body, uint16_t len) {
   UsbCaptureSetFilterCommand cmd = {};
-  if (len < sizeof(cmd)) {
+  if (len < USB_CAPTURE_SET_FILTER_V1_BYTES) {
     return USB_CAPTURE_REPLY_INVALID;
   }
-  memcpy(&cmd, body, sizeof(cmd));
+  memcpy(&cmd, body, len < sizeof(cmd) ? len : sizeof(cmd));
+  if (len < sizeof(cmd)) {
+    cmd.data_mode = USB_CAPTURE_DATA_MODE_DEFAULT;
+  }
   const uint8_t mask = cmd.slot_mask & ALL_SLOTS_MASK;
-  if (mask == 0) {
+  if (mask == 0 || cmd.data_mode >= DOT11_DATA_MODE_COUNT) {
     return USB_CAPTURE_REPLY_INVALID;
   }
   for (uint8_t s = 0; s < SLOT_COUNT; s++) {
@@ -627,6 +643,7 @@ int8_t handleSetFilter(const uint8_t* body, uint16_t len) {
       slot_config[s].snaplen_mgmt = cmd.snaplen_mgmt;
       slot_config[s].snaplen_ctrl = cmd.snaplen_ctrl;
       slot_config[s].snaplen_data = cmd.snaplen_data;
+      slot_config[s].data_mode = cmd.data_mode;
     }
   }
   if (radio_session) {
