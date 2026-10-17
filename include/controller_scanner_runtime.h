@@ -7,6 +7,7 @@
 class Adafruit_NeoPixel;
 
 #include "pico/util/queue.h"
+#include "spi_protocol_shared.h"
 #include "wifi_dedupe.h"
 
 // Cross-core resources owned by controller_main.cpp and consumed by the
@@ -101,3 +102,9 @@ bool controllerScannerMonitorApplied();
 
 // core0: latest state core1 reported for a slot.
 void controllerScannerMonitorSlotStatus(uint8_t slot, ControllerMonitorSlotStatus& out);
+
+// core0: capabilities the scanner in a slot reported (CMD_RADIO_INFO), read by
+// core1 whenever it identifies the slot. Returns false if no scanner has
+// answered in that slot; out.flags lacks RADIO_INFO_VALID if it answered but
+// predates the command.
+bool controllerScannerRadioInfo(uint8_t slot, RadioInfoReply& out);

@@ -5,6 +5,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 
 #include "wifi_result_utils.h"
 
@@ -75,6 +76,106 @@ bool scannerRadioInit() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
   return true;
+}
+
+// Widths esp_wifi_set_bandwidth accepts in the current band mode and
+// protocol, leaving the original bandwidth in place.
+static uint8_t probeWidths() {
+  wifi_bandwidth_t original = WIFI_BW_HT20;
+  const bool have_original = esp_wifi_get_bandwidth(WIFI_IF_STA, &original) == ESP_OK;
+  static const struct {
+    wifi_bandwidth_t bw;
+    uint8_t bit;
+  } kWidths[] = {
+      {WIFI_BW_HT20, RADIO_WIDTH_20},
+      {WIFI_BW_HT40, RADIO_WIDTH_40},
+      {WIFI_BW80, RADIO_WIDTH_80},
+      {WIFI_BW160, RADIO_WIDTH_160},
+  };
+  uint8_t mask = 0;
+  for (const auto& w : kWidths) {
+    if (esp_wifi_set_bandwidth(WIFI_IF_STA, w.bw) == ESP_OK) {
+      mask |= w.bit;
+    }
+  }
+  if (have_original) {
+    esp_wifi_set_bandwidth(WIFI_IF_STA, original);
+  }
+  return mask;
+}
+
+// Probe one band: channels the driver accepts, the configured protocols, and
+// widths both as configured and with an 11n-only protocol set.
+static void probeBand(wifi_band_mode_t mode, uint8_t n_only_protocols, RadioInfoReply& out) {
+  if (esp_wifi_set_band_mode(mode) != ESP_OK) {
+    return;
+  }
+  const bool five = (mode == WIFI_BAND_MODE_5G_ONLY);
+  if (five) {
+    for (uint8_t i = 0; i < RADIO_5G_CHANNEL_COUNT; i++) {
+      if (esp_wifi_set_channel(RADIO_5G_CHANNELS[i], WIFI_SECOND_CHAN_NONE) == ESP_OK) {
+        out.chan5_mask |= (1UL << i);
+      } else {
+        out.channel_errors++;
+      }
+    }
+  } else {
+    for (uint8_t ch = 1; ch <= 14; ch++) {
+      if (esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE) == ESP_OK) {
+        out.chan24_mask |= static_cast<uint16_t>(1U << ch);
+      } else {
+        out.channel_errors++;
+      }
+    }
+  }
+
+  uint8_t protocols = 0;
+  const bool have_protocols = esp_wifi_get_protocol(WIFI_IF_STA, &protocols) == ESP_OK;
+  const uint8_t now = probeWidths();
+  uint8_t capable = now;
+  if (have_protocols && esp_wifi_set_protocol(WIFI_IF_STA, n_only_protocols) == ESP_OK) {
+    capable |= probeWidths();
+    esp_wifi_set_protocol(WIFI_IF_STA, protocols);
+  }
+  if (five) {
+    out.protocols5 = protocols;
+    out.widths5_now = now;
+    out.widths5_capable = capable;
+  } else {
+    out.protocols24 = protocols;
+    out.widths24_now = now;
+    out.widths24_capable = capable;
+  }
+}
+
+void scannerRadioProbeCapabilities(RadioInfoReply& out) {
+  memset(&out, 0, sizeof(out));
+  out.status = 0;
+  if (!WiFi.enableSTA(true)) {
+    return;
+  }
+
+  wifi_country_t country = {};
+  if (esp_wifi_get_country(&country) == ESP_OK) {
+    memcpy(out.country, country.cc, sizeof(out.country));
+    out.policy = static_cast<uint8_t>(country.policy);
+    out.max_tx_power = country.max_tx_power;
+    out.country_schan = country.schan;
+    out.country_nchan = country.nchan;
+    out.country_5g_mask = country.wifi_5g_channel_mask;
+    out.flags |= RADIO_INFO_COUNTRY_VALID;
+  }
+
+  wifi_band_mode_t original_mode = WIFI_BAND_MODE_AUTO;
+  esp_wifi_get_band_mode(&original_mode);
+  probeBand(WIFI_BAND_MODE_2G_ONLY, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N, out);
+  probeBand(WIFI_BAND_MODE_5G_ONLY, WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N, out);
+  esp_wifi_set_band_mode(original_mode);
+  out.flags |= RADIO_INFO_VALID;
+
+  // Back to the state scannerRadioInit leaves: STA stopped until a scan or
+  // capture brings it up.
+  WiFi.disconnect(true, true);
 }
 
 int scannerRadioStartAsyncScan(uint8_t /*band*/, uint8_t channel, bool passive, int dwell_ms) {

@@ -11,6 +11,7 @@
 #include "capture_ring.h"
 #include "class/vendor/vendor_device.h"
 #include "controller_scanner_runtime.h"
+#include "radio_channels.h"
 #include "spi_protocol_shared.h"
 
 // This module owns the host-facing packet capture interface: the vendor-class
@@ -31,6 +32,18 @@ constexpr uint8_t SLOT_COUNT = 1;
 #endif
 static_assert(SLOT_COUNT <= USB_CAPTURE_MAX_SLOTS, "Too many scanner slots for the capture protocol");
 constexpr uint8_t ALL_SLOTS_MASK = static_cast<uint8_t>((1u << SLOT_COUNT) - 1u);
+
+// GET_RADIO_INFO copies scanner width bits straight into USB fields.
+static_assert(RADIO_WIDTH_20 == USB_CAPTURE_WIDTH_20 && RADIO_WIDTH_40 == USB_CAPTURE_WIDTH_40 &&
+                  RADIO_WIDTH_80 == USB_CAPTURE_WIDTH_80 && RADIO_WIDTH_160 == USB_CAPTURE_WIDTH_160,
+              "Radio and USB width bits must match");
+static_assert(RADIO_CHAN_WIDTH_20 == USB_CAPTURE_CHAN_20 &&
+                  RADIO_CHAN_WIDTH_40_ABOVE == USB_CAPTURE_CHAN_40_ABOVE &&
+                  RADIO_CHAN_WIDTH_40_BELOW == USB_CAPTURE_CHAN_40_BELOW &&
+                  RADIO_CHAN_WIDTH_80 == USB_CAPTURE_CHAN_80,
+              "Radio and USB per-channel width bits must match");
+static_assert(RADIO_BAND_24GHZ == USB_CAPTURE_BAND_24GHZ && RADIO_BAND_5GHZ == USB_CAPTURE_BAND_5GHZ,
+              "Radio and USB band values must match");
 
 static_assert(CaptureRing::capacityValid(USB_CAPTURE_PACKET_RING_BYTES),
               "USB_CAPTURE_PACKET_RING_BYTES must be a power of two");
@@ -622,6 +635,92 @@ int8_t handleSetFilter(const uint8_t* body, uint16_t len) {
   return USB_CAPTURE_REPLY_OK;
 }
 
+// GET_RADIO_INFO: per slot, what the scanner reported plus the channels it
+// accepts, each tagged with the widths it can be used at.
+void handleGetRadioInfo(const UsbCaptureRecordHeader& hdr) {
+  constexpr uint16_t kMaxChannels = 14 + RADIO_5G_CHANNEL_COUNT;
+  constexpr uint16_t kMaxPayload =
+      sizeof(UsbCaptureRadioInfoHeader) +
+      SLOT_COUNT * (sizeof(UsbCaptureRadioSlot) + kMaxChannels * sizeof(UsbCaptureChannelInfo));
+  static uint8_t body[sizeof(UsbCaptureReplyHeader) + kMaxPayload];
+  static_assert(sizeof(UsbCaptureRecordHeader) + sizeof(body) <= USB_CAPTURE_CONTROL_RING_BYTES,
+                "Radio info reply must fit the control ring");
+
+  uint16_t len = 0;
+  UsbCaptureReplyHeader reply = {};
+  reply.command = hdr.type;
+  reply.status = USB_CAPTURE_REPLY_OK;
+  memcpy(body + len, &reply, sizeof(reply));
+  len += sizeof(reply);
+  UsbCaptureRadioInfoHeader info_header = {};
+  info_header.slot_count = SLOT_COUNT;
+  memcpy(body + len, &info_header, sizeof(info_header));
+  len += sizeof(info_header);
+
+  for (uint8_t s = 0; s < SLOT_COUNT; s++) {
+    RadioInfoReply info = {};
+    const bool present = controllerScannerRadioInfo(s, info);
+    const bool valid = present && (info.flags & RADIO_INFO_VALID);
+    UsbCaptureRadioSlot slot = {};
+    slot.slot = s;
+    slot.flags = (present ? USB_CAPTURE_RADIO_PRESENT : 0) | (valid ? USB_CAPTURE_RADIO_INFO : 0);
+    const uint16_t slot_offset = len;
+    len += sizeof(slot);
+    if (valid) {
+      memcpy(slot.country, info.country, sizeof(slot.country));
+      // RADIO_WIDTH_* and USB_CAPTURE_WIDTH_* share bit positions.
+      slot.widths_24_now = info.widths24_now;
+      slot.widths_5_now = info.widths5_now;
+      slot.widths_24_capable = info.widths24_capable;
+      slot.widths_5_capable = info.widths5_capable;
+      slot.protocols_24 = info.protocols24;
+      slot.protocols_5 = info.protocols5;
+      const bool country = info.flags & RADIO_INFO_COUNTRY_VALID;
+      const uint32_t country5 = radioCountry5gMask(info.country_5g_mask);
+      if (country) {
+        slot.country_schan = info.country_schan;
+        slot.country_nchan = info.country_nchan;
+        slot.country_policy = info.policy;
+        slot.max_tx_power = info.max_tx_power;
+        slot.country_5g_mask = country5;
+      }
+      const RadioChannelSet set = {info.chan24_mask, info.chan5_mask};
+      auto add = [&](uint8_t band, uint8_t channel, uint8_t band_widths) {
+        // Any accepted channel works at 20 MHz even if the width probe failed.
+        const uint8_t widths = radioChannelWidths(set, band, channel, band_widths | RADIO_WIDTH_20);
+        if (widths == 0) {
+          return;
+        }
+        UsbCaptureChannelInfo entry = {};
+        entry.band = band;
+        entry.channel = channel;
+        // RADIO_CHAN_WIDTH_* and USB_CAPTURE_CHAN_* share bit positions.
+        entry.widths = widths;
+        const RadioRegulatory reg =
+            country ? radioChannelRegulatory(band, channel, info.country_schan,
+                                             info.country_nchan, country5)
+                    : RADIO_REG_UNKNOWN;
+        if (reg == RADIO_REG_ALLOWED) {
+          entry.flags |= USB_CAPTURE_CHAN_REG_ALLOWED;
+        } else if (reg == RADIO_REG_UNKNOWN) {
+          entry.flags |= USB_CAPTURE_CHAN_REG_UNKNOWN;
+        }
+        memcpy(body + len, &entry, sizeof(entry));
+        len += sizeof(entry);
+        slot.channel_count++;
+      };
+      for (uint8_t ch = 1; ch <= 14; ch++) {
+        add(USB_CAPTURE_BAND_24GHZ, ch, info.widths24_capable);
+      }
+      for (uint8_t i = 0; i < RADIO_5G_CHANNEL_COUNT; i++) {
+        add(USB_CAPTURE_BAND_5GHZ, RADIO_5G_CHANNELS[i], info.widths5_capable);
+      }
+    }
+    memcpy(body + slot_offset, &slot, sizeof(slot));
+  }
+  queueControlRecord(USB_CAPTURE_REC_REPLY, hdr.seq, body, len);
+}
+
 // Caller holds __usb_mutex (HELLO resets the TinyUSB FIFO).
 void handleCommand(const UsbCaptureRecordHeader& hdr, const uint8_t* body, uint16_t len) {
   last_host_ms = nowMs();
@@ -656,6 +755,9 @@ void handleCommand(const UsbCaptureRecordHeader& hdr, const uint8_t* body, uint1
     case USB_CAPTURE_CMD_GET_STATUS:
       sendReply(hdr.type, hdr.seq, USB_CAPTURE_REPLY_OK);
       sendStatus();
+      return;
+    case USB_CAPTURE_CMD_GET_RADIO_INFO:
+      handleGetRadioInfo(hdr);
       return;
     default:
       status = USB_CAPTURE_REPLY_UNKNOWN_COMMAND;

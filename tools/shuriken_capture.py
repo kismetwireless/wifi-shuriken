@@ -56,6 +56,7 @@ CMD_SET_CHANNEL = 0x05
 CMD_SET_HOP = 0x06
 CMD_SET_FILTER = 0x07
 CMD_GET_STATUS = 0x08
+CMD_GET_RADIO_INFO = 0x09
 REC_REPLY = 0x80
 REC_PACKET = 0x81
 REC_STATUS = 0x82
@@ -94,6 +95,18 @@ INFO = struct.Struct("<BBHI16s")               # proto, slots, max_pkt, caps, fw
 PACKET_HEADER = struct.Struct("<BBBbbBBBIQHH")
 STATUS_HEADER = struct.Struct("<BBHIIIII")
 SLOT_STATUS = struct.Struct("<BBBBIII")
+RADIO_INFO_HEADER = struct.Struct("<B3x")
+# slot, flags, country, nchan, widths x4, protocols x2, schan, nchan, policy, tx power, 5G mask
+RADIO_SLOT = struct.Struct("<BB3sBBBBBHHBBBb2xI")
+CHANNEL_INFO = struct.Struct("<BBBB")         # band, channel, widths, regulatory flags
+CHAN_REG_ALLOWED = 1 << 0
+CHAN_REG_UNKNOWN = 1 << 1
+
+RADIO_PRESENT = 1 << 0
+RADIO_INFO = 1 << 1
+WIDTH_NAMES = ((1 << 0, "20"), (1 << 1, "40"), (1 << 2, "80"), (1 << 3, "160"))
+CHAN_WIDTH_NAMES = ((1 << 0, "20"), (1 << 1, "40+"), (1 << 2, "40-"), (1 << 3, "80"))
+PROTOCOL_NAMES = ((0x01, "b"), (0x02, "g"), (0x04, "n"), (0x10, "a"), (0x20, "ac"), (0x40, "ax"))
 
 LINKTYPE_IEEE802_11_RADIOTAP = 127
 # Radiotap: TSFT, Flags, Channel, dBm antenna signal, dBm antenna noise.
@@ -351,6 +364,75 @@ def parse_status(body):
     return status
 
 
+def parse_radio_info(payload):
+    """Decode a GET_RADIO_INFO reply into one dict per slot."""
+    (slot_count,) = RADIO_INFO_HEADER.unpack_from(payload)
+    off = RADIO_INFO_HEADER.size
+    slots = []
+    for _ in range(slot_count):
+        (slot, flags, country, nchan, w24_now, w5_now, w24_cap, w5_cap, proto24, proto5,
+         schan, cnchan, policy, max_tx, mask5) = RADIO_SLOT.unpack_from(payload, off)
+        off += RADIO_SLOT.size
+        channels = []
+        for _ in range(nchan):
+            band, channel, widths, cflags = CHANNEL_INFO.unpack_from(payload, off)
+            off += CHANNEL_INFO.size
+            channels.append(dict(band=band, channel=channel, widths=widths, flags=cflags))
+        slots.append(dict(slot=slot, flags=flags,
+                          country=country.split(b"\0", 1)[0].decode(errors="replace"),
+                          widths_24_now=w24_now, widths_5_now=w5_now,
+                          widths_24_capable=w24_cap, widths_5_capable=w5_cap,
+                          protocols_24=proto24, protocols_5=proto5,
+                          country_schan=schan, country_nchan=cnchan, country_policy=policy,
+                          max_tx_power=max_tx, country_5g_mask=mask5, channels=channels))
+    return slots
+
+
+def bit_names(value, names, sep="/"):
+    return sep.join(n for bit, n in names if value & bit) or "-"
+
+
+def print_radio_info(slots):
+    for s in slots:
+        name = "shuriken%02d (slot %d)" % (s["slot"] + 1, s["slot"])
+        if not s["flags"] & RADIO_PRESENT:
+            print("%s: no scanner" % name)
+            continue
+        if not s["flags"] & RADIO_INFO:
+            print("%s: scanner firmware does not report radio info" % name)
+            continue
+        print("%s: country %r  2.4 GHz 802.11%s, widths %s now / %s capable"
+              "  5 GHz 802.11%s, widths %s now / %s capable" % (
+                  name, s["country"],
+                  bit_names(s["protocols_24"], PROTOCOL_NAMES, ""),
+                  bit_names(s["widths_24_now"], WIDTH_NAMES),
+                  bit_names(s["widths_24_capable"], WIDTH_NAMES),
+                  bit_names(s["protocols_5"], PROTOCOL_NAMES, ""),
+                  bit_names(s["widths_5_now"], WIDTH_NAMES),
+                  bit_names(s["widths_5_capable"], WIDTH_NAMES)))
+        mask5 = s["country_5g_mask"]
+        print("    regulatory: policy %s, max tx %d dBm, 2.4 GHz %s, 5 GHz %s" % (
+            "manual" if s["country_policy"] else "auto", s["max_tx_power"],
+            "%d-%d" % (s["country_schan"], s["country_schan"] + s["country_nchan"] - 1)
+            if s["country_nchan"] else "not given",
+            " ".join(str(c["channel"]) for c in s["channels"]
+                     if c["band"] == BAND_5GHZ and c["flags"] & CHAN_REG_ALLOWED)
+            if mask5 else "driver defaults (not reported)"))
+
+        def mark(c):
+            if c["flags"] & CHAN_REG_ALLOWED:
+                return ""
+            return "?" if c["flags"] & CHAN_REG_UNKNOWN else "*"
+        for band, label in ((BAND_24GHZ, "2.4 GHz"), (BAND_5GHZ, "5 GHz")):
+            chans = [c for c in s["channels"] if c["band"] == band]
+            print("    %-7s %s" % (label, " ".join(
+                "%d%s[%s]" % (c["channel"], mark(c),
+                              bit_names(c["widths"], CHAN_WIDTH_NAMES, ","))
+                for c in chans) or "-"))
+    print("channels: * = tunable but outside the country record, "
+          "? = country record does not say")
+
+
 def parse_channel_list(text):
     entries = []
     for item in text.split(","):
@@ -401,6 +483,8 @@ def main():
                     help="synthetic frame length in bytes (default 200)")
     ap.add_argument("--duration", type=float, help="stop after this many seconds")
     ap.add_argument("--info", action="store_true", help="print device info and exit")
+    ap.add_argument("--radio-info", action="store_true",
+                    help="print each radio's supported channels and widths and exit")
     ap.add_argument("-q", "--quiet", action="store_true", help="no per-second stats")
     args = ap.parse_args()
 
@@ -418,6 +502,10 @@ def main():
                                 (CAP_CHANNEL_HOP, "hop")) if caps & b) or "none"),
         file=sys.stderr)
     if args.info:
+        dev.close()
+        return
+    if args.radio_info:
+        print_radio_info(parse_radio_info(dev.checked("GET_RADIO_INFO", CMD_GET_RADIO_INFO)))
         dev.close()
         return
 

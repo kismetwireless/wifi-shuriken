@@ -53,6 +53,7 @@ enum SpiCommand : uint8_t {
   CMD_PKT_READ      = 0x23,
   CMD_PKT_DIAG      = 0x24,
   CMD_MONITOR_HOP   = 0x25,
+  CMD_RADIO_INFO    = 0x26,
 };
 
 enum ResultType : uint8_t {
@@ -209,6 +210,48 @@ struct __attribute__((packed)) MonitorHopCommand {
   uint8_t reserved;
   MonitorHopEntry entries[MONITOR_HOP_ENTRIES_PER_FRAME];
   uint16_t first_hop_delay_ms;
+};
+
+// ---------- Radio capabilities ----------
+// CMD_RADIO_INFO reports what the scanner measured at boot: which channels the
+// radio accepts on each band and which channel widths it can be set to.
+
+// Channel width bits (RadioInfoReply.widths_*).
+static constexpr uint8_t RADIO_WIDTH_20 = 0x01;
+static constexpr uint8_t RADIO_WIDTH_40 = 0x02;
+static constexpr uint8_t RADIO_WIDTH_80 = 0x04;
+static constexpr uint8_t RADIO_WIDTH_160 = 0x08;
+
+// RadioInfoReply.flags.
+static constexpr uint8_t RADIO_INFO_VALID = 0x01;          // Probe ran; fields are meaningful.
+static constexpr uint8_t RADIO_INFO_COUNTRY_VALID = 0x02;  // esp_wifi_get_country succeeded.
+
+// 5 GHz channel for each bit of RadioInfoReply.chan5_mask (bit i), matching
+// ESP-IDF's wifi_5g_channel_bit_t (which uses bit i + 1).
+static constexpr uint8_t RADIO_5G_CHANNEL_COUNT = 28;
+static constexpr uint8_t RADIO_5G_CHANNELS[RADIO_5G_CHANNEL_COUNT] = {
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120,
+    124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165, 169, 173, 177};
+
+struct __attribute__((packed)) RadioInfoReply {
+  int8_t status;
+  uint8_t flags;
+  char country[3];        // ESP-IDF country code, e.g. "01" (world) plus env char.
+  uint8_t policy;         // wifi_country_policy_t: 0 auto, 1 manual.
+  int8_t max_tx_power;    // Country limit in dBm (wifi_country_t; not the 0.25 dBm
+                          // units esp_wifi_set_max_tx_power takes).
+  uint8_t country_schan;  // 2.4 GHz range from the country record.
+  uint8_t country_nchan;
+  uint16_t chan24_mask;   // Bit n set: 2.4 GHz channel n accepted (1..14).
+  uint32_t chan5_mask;    // Bit i set: RADIO_5G_CHANNELS[i] accepted.
+  uint32_t country_5g_mask;  // Raw wifi_5g_channel_mask (0: regulatory default).
+  uint8_t widths24_now;      // Widths settable with the protocols as configured.
+  uint8_t widths5_now;
+  uint8_t widths24_capable;  // Widths settable with 11n-only protocols.
+  uint8_t widths5_capable;
+  uint16_t protocols24;      // WIFI_PROTOCOL_* bits as configured.
+  uint16_t protocols5;
+  uint8_t channel_errors;    // Channels the driver rejected while probing.
 };
 
 // ---------- Captured packet batches ----------
@@ -452,3 +495,4 @@ static_assert(sizeof(MonitorPacketRecord) == 16, "MonitorPacketRecord must be 16
 static_assert(PKT_BATCH_MAX_BYTES % 4 == 0, "Batches must stay word aligned for DMA");
 static_assert(sizeof(MonitorStatsReply) <= SPI_FRAME_TAG_INDEX, "MonitorStatsReply must fit before the tag byte");
 static_assert(sizeof(MonitorHopCommand) <= SPI_FRAME_TAG_INDEX, "MonitorHopCommand must fit before the tag byte");
+static_assert(sizeof(RadioInfoReply) <= SPI_FRAME_TAG_INDEX, "RadioInfoReply must fit before the tag byte");

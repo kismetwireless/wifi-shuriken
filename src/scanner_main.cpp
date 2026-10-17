@@ -86,6 +86,8 @@ static uint8_t trail_tx[FRAME_SIZE] __attribute__((aligned(4)));
 static uint8_t trail_rx[FRAME_SIZE] __attribute__((aligned(4)));
 static uint8_t bulk_rx[PKT_BATCH_MAX_BYTES] __attribute__((aligned(4)));
 static PktDiagReply bulk_diag = {};
+// Measured once at boot, before the SPI link comes up.
+static RadioInfoReply radio_info = {};
 
 // Boot diagnostics are emitted repeatedly for a short window so they remain visible
 // even when USB CDC enumeration lags behind firmware startup.
@@ -175,6 +177,7 @@ static const char* cmd_to_str(uint8_t cmd) {
     case CMD_PKT_READ: return "PKT_READ";
     case CMD_PKT_DIAG: return "PKT_DIAG";
     case CMD_MONITOR_HOP: return "MONITOR_HOP";
+    case CMD_RADIO_INFO: return "RADIO_INFO";
     default: return "UNKNOWN";
   }
 }
@@ -908,6 +911,10 @@ static void handleCmdMonitorHop() {
   write_status_response(scannerMonitorSetHop(hop));
 }
 
+static void handleCmdRadioInfo() {
+  memcpy(tx_buf, &radio_info, sizeof(radio_info));
+}
+
 static void handleCmdMonitorStop() {
   scannerMonitorStop();
   write_status_response(SCANNER_STATUS_OK);
@@ -979,6 +986,7 @@ static void handle_command(uint8_t cmd_byte) {
     case CMD_PKT_READ: handleCmdPktRead(); break;
     case CMD_PKT_DIAG: handleCmdPktDiag(); break;
     case CMD_MONITOR_HOP: handleCmdMonitorHop(); break;
+    case CMD_RADIO_INFO: handleCmdRadioInfo(); break;
 
     default:
       // Unknown command: return 0
@@ -1007,6 +1015,11 @@ void setup() {
     SCANNER_LOG_PRINTLN("scannerRadioInit failed");
     while (1) delay(1000);
   }
+  scannerRadioProbeCapabilities(radio_info);
+  SCANNER_LOG_PRINTF("Radio probe: country %.2s 2.4G mask 0x%04x 5G mask 0x%08lx widths %02x/%02x\n",
+                     radio_info.country, radio_info.chan24_mask,
+                     (unsigned long)radio_info.chan5_mask, radio_info.widths24_capable,
+                     radio_info.widths5_capable);
   delay(100);
 
   if (!scannerSpiSlaveInit(PIN_SCK, PIN_MOSI, PIN_MISO, PIN_CS,

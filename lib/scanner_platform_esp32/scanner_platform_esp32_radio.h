@@ -10,6 +10,13 @@ static constexpr int8_t SCANNER_RADIO_SCAN_FAILED = -2;
 
 bool scannerRadioInit();
 
+// Measure what this radio accepts: every 2.4/5 GHz channel and every channel
+// width, with protocols as configured and with 11n-only protocols. Changes
+// band mode, channel, protocol and bandwidth while it runs and restores them
+// (and the stopped-STA state scannerRadioInit leaves) afterwards, so call it
+// before scanning starts.
+void scannerRadioProbeCapabilities(RadioInfoReply& out);
+
 // Starts async channel scan. Returns SCANNER_RADIO_SCAN_FAILED on failure.
 // On success, backend may return SCANNER_RADIO_SCAN_RUNNING or another
 // backend-specific success value.

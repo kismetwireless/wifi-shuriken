@@ -37,6 +37,7 @@ enum UsbCaptureRecordType : uint8_t {
   USB_CAPTURE_CMD_SET_HOP     = 0x06,
   USB_CAPTURE_CMD_SET_FILTER  = 0x07,
   USB_CAPTURE_CMD_GET_STATUS  = 0x08,
+  USB_CAPTURE_CMD_GET_RADIO_INFO = 0x09,
   // Device -> host.
   USB_CAPTURE_REC_REPLY       = 0x80,
   USB_CAPTURE_REC_PACKET      = 0x81,
@@ -76,6 +77,30 @@ static constexpr uint8_t USB_CAPTURE_PKT_FCS_INCLUDED = (1u << 0);
 static constexpr uint8_t USB_CAPTURE_PKT_TRUNCATED = (1u << 1);
 static constexpr uint8_t USB_CAPTURE_PKT_BAD_FCS = (1u << 2);
 static constexpr uint8_t USB_CAPTURE_PKT_SYNTHETIC = (1u << 3);
+
+// UsbCaptureRadioSlot.flags.
+static constexpr uint8_t USB_CAPTURE_RADIO_PRESENT = (1u << 0);  // Scanner answered on SPI.
+static constexpr uint8_t USB_CAPTURE_RADIO_INFO = (1u << 1);     // Capabilities reported.
+
+// UsbCaptureRadioSlot.widths_*: widths the radio can be set to on that band.
+static constexpr uint8_t USB_CAPTURE_WIDTH_20 = (1u << 0);
+static constexpr uint8_t USB_CAPTURE_WIDTH_40 = (1u << 1);
+static constexpr uint8_t USB_CAPTURE_WIDTH_80 = (1u << 2);
+static constexpr uint8_t USB_CAPTURE_WIDTH_160 = (1u << 3);
+
+// UsbCaptureChannelInfo.flags: what the country record says about the channel.
+static constexpr uint8_t USB_CAPTURE_CHAN_REG_ALLOWED = (1u << 0);  // Permitted by the record.
+static constexpr uint8_t USB_CAPTURE_CHAN_REG_UNKNOWN = (1u << 1);  // Record does not say.
+
+// UsbCaptureRadioSlot.country_policy (wifi_country_policy_t).
+static constexpr uint8_t USB_CAPTURE_COUNTRY_POLICY_AUTO = 0;
+static constexpr uint8_t USB_CAPTURE_COUNTRY_POLICY_MANUAL = 1;
+
+// UsbCaptureChannelInfo.widths: what this channel can be used as.
+static constexpr uint8_t USB_CAPTURE_CHAN_20 = (1u << 0);
+static constexpr uint8_t USB_CAPTURE_CHAN_40_ABOVE = (1u << 1);  // HT40+
+static constexpr uint8_t USB_CAPTURE_CHAN_40_BELOW = (1u << 2);  // HT40-
+static constexpr uint8_t USB_CAPTURE_CHAN_80 = (1u << 3);
 
 // Band values match WIFI_BAND_* in wifi_result_utils.h.
 static constexpr uint8_t USB_CAPTURE_BAND_24GHZ = 2;
@@ -183,6 +208,50 @@ struct __attribute__((packed)) UsbCaptureSlotStatus {
   uint32_t transport_errors;
 };
 
+// GET_RADIO_INFO reply payload: this header, then slot_count blocks of
+// UsbCaptureRadioSlot each followed by its channel_count UsbCaptureChannelInfo.
+struct __attribute__((packed)) UsbCaptureRadioInfoHeader {
+  uint8_t slot_count;
+  uint8_t reserved[3];
+};
+
+struct __attribute__((packed)) UsbCaptureRadioSlot {
+  uint8_t slot;
+  uint8_t flags;
+  char country[3];        // ESP-IDF country code ("01" = world-safe default).
+  uint8_t channel_count;
+  // Widths settable with protocols as configured (802.11ax limits the C5 to
+  // 20 MHz) and with 802.11n-only protocols.
+  uint8_t widths_24_now;
+  uint8_t widths_5_now;
+  uint8_t widths_24_capable;
+  uint8_t widths_5_capable;
+  // WIFI_PROTOCOL_* bits configured per band (11b=1 11g=2 11n=4 11a=16
+  // 11ac=32 11ax=64).
+  uint16_t protocols_24;
+  uint16_t protocols_5;
+  // Regulatory data from the radio's ESP-IDF country record.
+  uint8_t country_schan;   // 2.4 GHz channels schan .. schan + nchan - 1.
+  uint8_t country_nchan;
+  uint8_t country_policy;  // USB_CAPTURE_COUNTRY_POLICY_*.
+  int8_t max_tx_power;     // Country limit in dBm.
+  uint8_t reserved[2];
+  // Bit i: RADIO_5G_CHANNELS[i] (36, 40, ... 177) permitted. 0 means the
+  // record leaves 5 GHz to the driver's built-in regulatory defaults.
+  uint32_t country_5g_mask;
+};
+
+// Per-channel widths assume the capable widths and require every channel the
+// wider channel spans to be one the radio accepts.
+// channels lists every channel the radio accepted when probed, which can be
+// wider than the country record allows; flags says which ones it permits.
+struct __attribute__((packed)) UsbCaptureChannelInfo {
+  uint8_t band;
+  uint8_t channel;
+  uint8_t widths;
+  uint8_t flags;
+};
+
 // Followed by slot_count UsbCaptureSlotStatus values.
 struct __attribute__((packed)) UsbCaptureStatusHeader {
   uint8_t active;
@@ -206,6 +275,11 @@ static_assert(sizeof(UsbCaptureInfo) == 24, "UsbCaptureInfo must be 24 bytes");
 static_assert(sizeof(UsbCapturePacketHeader) == 24, "UsbCapturePacketHeader must be 24 bytes");
 static_assert(sizeof(UsbCaptureSlotStatus) == 16, "UsbCaptureSlotStatus must be 16 bytes");
 static_assert(sizeof(UsbCaptureStatusHeader) == 24, "UsbCaptureStatusHeader must be 24 bytes");
+static_assert(sizeof(UsbCaptureRadioInfoHeader) == 4, "UsbCaptureRadioInfoHeader must be 4 bytes");
+static_assert(sizeof(UsbCaptureRadioSlot) == 24, "UsbCaptureRadioSlot must be 24 bytes");
+static_assert(offsetof(UsbCaptureRadioSlot, country_5g_mask) == 20,
+              "country_5g_mask must stay 4-byte aligned in the reply");
+static_assert(sizeof(UsbCaptureChannelInfo) == 4, "UsbCaptureChannelInfo must be 4 bytes");
 static_assert(sizeof(UsbCaptureRecordHeader) + sizeof(UsbCaptureSetHopCommand) +
                   USB_CAPTURE_MAX_HOP_CHANNELS * sizeof(UsbCaptureHopEntry) <=
                   USB_CAPTURE_MAX_COMMAND_BYTES,

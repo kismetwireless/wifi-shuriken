@@ -1,8 +1,9 @@
 # Monitor mode switching
 
 How a USB host moves the WiFi Shuriken from its normal WiGLE scanning mode into
-promiscuous (monitor) capture and back, and what each part of the system does
-along the way.
+promiscuous (monitor) capture and back, what each part of the system does
+along the way, and how a host finds out which channels and widths each radio
+supports.
 
 The wire formats live in two headers, which are the source of truth:
 
@@ -66,6 +67,7 @@ reply record echoing its sequence number and a status byte.
 | `START` (0x02) | Without `USB_CAPTURE_START_SYNTHETIC`: radio capture on the slots in `slot_mask`. With it: synthetic capture. |
 | `KEEPALIVE` (0x04) | Must arrive (or any other command) at least every 5 s while a session runs. |
 | `GET_STATUS` (0x08) | Replies, then queues a status record immediately. |
+| `GET_RADIO_INFO` (0x09) | Replies with each radio's supported channels, channel widths and regulatory data (see [Radio capabilities](#radio-capabilities)). Works in any mode, with or without a session. |
 | `STOP` (0x03) | Ends the session; the device returns to scanning. |
 
 Defaults after `HELLO`: slots on channels 1, 6, 11, 36, 44, 149; management and
@@ -178,6 +180,7 @@ in the last byte of a later frame.
 | `CMD_MONITOR_HOP` (0x25) | Installs a hop list in chunks of up to 24 entries; it takes effect when the chunk holding the last entry arrives. `total_count` 0 turns hopping off. Does not reset the capture ring. |
 | `CMD_MONITOR_STOP` (0x21) | Leaves promiscuous mode and restores band mode `AUTO` so scanning can use both bands. |
 | `CMD_PKT_READ` (0x23) | Captured-frame transport; see `spi_protocol_shared.h`. |
+| `CMD_RADIO_INFO` (0x26) | Returns the radio capabilities the scanner measured at boot (`RadioInfoReply`). Read-only; does not touch the radio. |
 | `CMD_MONITOR_STATS` (0x22), `CMD_PKT_DIAG` (0x24) | Diagnostics (used by the monitor probe build). |
 
 Scanners never leave monitor mode on their own and keep their state across a
@@ -206,6 +209,74 @@ period within ~0.5% of nominal, and two slots on the same channel in ~3% of
 samples (largely timestamp jitter: pcap timestamps are when the controller
 queued the frame, not air time).
 
+## Radio capabilities
+
+`GET_RADIO_INFO` tells a host which channels and widths each radio can use
+before it picks channels or a hop list.
+
+### Where the data comes from
+
+Each scanner measures its own radio once at boot, before its SPI link comes up
+(`scannerRadioProbeCapabilities()`), so the probe never competes with scanning
+or capture:
+
+- **Channels:** every 2.4 GHz channel (1–14) and every 5 GHz channel in
+  ESP-IDF's list (36–64, 100–144, 149–177) is tried with
+  `esp_wifi_set_channel`; the accepted ones are recorded.
+- **Widths:** 20/40/80/160 MHz are tried with `esp_wifi_set_bandwidth` on each
+  band, once with the protocols as configured and once with 802.11n-only
+  protocols. 802.11ax limits the C5 to 20 MHz, so the two differ.
+- **Regulatory:** the ESP-IDF country record (`esp_wifi_get_country`): country
+  code, policy, 2.4 GHz channel range, 5 GHz channel mask and TX power limit.
+
+Band mode, channel, protocols and bandwidth are restored afterwards. core1 reads
+the result with `CMD_RADIO_INFO` whenever it identifies a slot and caches it;
+`GET_RADIO_INFO` answers from that cache.
+
+### Reply layout
+
+`UsbCaptureRadioInfoHeader` (slot count), then per slot a `UsbCaptureRadioSlot`
+followed by its `UsbCaptureChannelInfo` entries:
+
+| `UsbCaptureRadioSlot` field | Meaning |
+|---|---|
+| `flags` | `RADIO_PRESENT` (scanner answered), `RADIO_INFO` (its firmware reports capabilities) |
+| `country` | ESP-IDF country code, e.g. `01` (world-safe default) |
+| `widths_{24,5}_now` | Widths settable with protocols as configured |
+| `widths_{24,5}_capable` | Widths settable with 802.11n-only protocols |
+| `protocols_{24,5}` | `WIFI_PROTOCOL_*` bits configured per band |
+| `country_schan`, `country_nchan` | 2.4 GHz channels the country record permits |
+| `country_policy`, `max_tx_power` | Country policy (auto/manual) and TX limit in dBm |
+| `country_5g_mask` | 5 GHz channels the record permits (bit *i* = *i*-th channel of 36, 40, … 177); 0 means the driver's built-in defaults, which it does not expose |
+
+Each `UsbCaptureChannelInfo` is one channel the radio accepted:
+
+| Field | Meaning |
+|---|---|
+| `band`, `channel` | The channel |
+| `widths` | `CHAN_20`, `CHAN_40_ABOVE` (HT40+), `CHAN_40_BELOW` (HT40-), `CHAN_80` |
+| `flags` | `CHAN_REG_ALLOWED` (country record permits it), `CHAN_REG_UNKNOWN` (record does not say); neither means tunable but outside the record |
+
+Per-channel widths assume the capable widths and require every channel the
+wider channel would span to be accepted too (`include/radio_channels.h`):
+HT40 on 2.4 GHz needs channel ±4 within 1–13 (never channel 14); on 5 GHz it
+uses the fixed pairs 36/40, 44/48, … 149/153, …; 80 MHz needs the whole block.
+
+### What the C5 radios report
+
+On this hardware every radio reports the same thing:
+
+| | 2.4 GHz | 5 GHz |
+|---|---|---|
+| Tunable | 1–14 | 36–64, 100–144, 149–177 |
+| Country `01` permits | 1–11 | 36–64 |
+| Widths now / capable | 20 / 20, 40 | 20 / 20, 40 |
+
+80 and 160 MHz are not supported. The tunable list is wider than the country
+record because `esp_wifi_set_channel` does not enforce the country; that
+matters for transmitting, not for passive capture. Capture currently always
+tunes 20 MHz.
+
 ## Unaffected while monitoring
 
 - **GPS NMEA passthrough** (second CDC port) — tested across a capture: 15
@@ -227,6 +298,15 @@ STOP                                    -> OK   (scanning and CSV logging resume
 With the reference tool:
 
 ```
+tools/shuriken_capture.py --radio-info
 tools/shuriken_capture.py -w out.pcap --split --hop 1,6,11,36,40,48,161 --dwell 200
 tools/shuriken_capture.py -w - | tshark -i - -l
+```
+
+A `.pcapng` output (or `--pcapng`) declares one capture interface per radio,
+named `shuriken01` … `shuriken06`, so each packet records which radio heard it
+(`frame.interface_name` in Wireshark/tshark):
+
+```
+tools/shuriken_capture.py -w out.pcapng
 ```

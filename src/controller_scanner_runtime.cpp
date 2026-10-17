@@ -1148,6 +1148,46 @@ bool controllerScannerRuntimeHandleScannerUpdatesFromSd(SdFat& sd,
 #endif
 }
 
+// Radio capabilities per slot, written by core1 when it identifies a slot and
+// read by core0 for GET_RADIO_INFO. Guarded by monitor_link_lock.
+static RadioInfoReply slot_radio_info[SCANNER_SLOT_COUNT] = {};
+static bool slot_radio_present[SCANNER_SLOT_COUNT] = {};
+
+// Ask the identified scanner on the active slot for its radio capabilities.
+static void scannerFetchRadioInfo(uint8_t slot) {
+  uint8_t tx[SCANNER_FRAME_SIZE] = {0};
+  uint8_t rx[SCANNER_FRAME_SIZE] = {0};
+  tx[0] = CMD_RADIO_INFO;
+  RadioInfoReply info = {};
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    if (scannerCommandWithResponse(tx, CMD_RADIO_INFO, rx, 20)) {
+      // A scanner without the command answers an all-zero frame: no flags.
+      memcpy(&info, rx, sizeof(info));
+      break;
+    }
+    delay(2);
+  }
+  if (slot >= SCANNER_SLOT_COUNT) {
+    return;
+  }
+  critical_section_enter_blocking(&monitor_link_lock);
+  slot_radio_info[slot] = info;
+  slot_radio_present[slot] = true;
+  critical_section_exit(&monitor_link_lock);
+}
+
+bool controllerScannerRadioInfo(uint8_t slot, RadioInfoReply& out) {
+  out = {};
+  if (slot >= SCANNER_SLOT_COUNT) {
+    return false;
+  }
+  critical_section_enter_blocking(&monitor_link_lock);
+  out = slot_radio_info[slot];
+  const bool present = slot_radio_present[slot];
+  critical_section_exit(&monitor_link_lock);
+  return present;
+}
+
 static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
   // Slot identity is cached until transport failures force a re-probe. This
   // keeps empty slots from consuming controller bandwidth every pass.
@@ -1228,6 +1268,7 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
                          (unsigned)slot,
                          id.proto_version, id.scanner_type, id.capabilities, id.max_results);
   scannerDrainStaleFrames(1);
+  scannerFetchRadioInfo(slot);
   return true;
 }
 
@@ -2449,6 +2490,7 @@ static bool monitorLinkEnsurePresent(MonitorSlotState& state) {
     return false;
   }
   state.present = true;
+  scannerFetchRadioInfo(static_cast<uint8_t>(&state - monitor_slots));
   return true;
 }
 
