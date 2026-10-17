@@ -108,6 +108,7 @@ BAND_5GHZ = 5
 RECORD_HEADER = struct.Struct("<HBBHH")        # magic, type, version, length, seq
 REPLY_HEADER = struct.Struct("<BbH")           # command, status, reserved
 INFO = struct.Struct("<BBHI16s")               # proto, slots, max_pkt, caps, fw
+INFO_REV = struct.Struct("<HBB")               # protocol revision year, month, number
 PACKET_HEADER = struct.Struct("<BBBbbBBBIQHH")
 STATUS_HEADER = struct.Struct("<BBHIIIII")
 SLOT_STATUS = struct.Struct("<BBBBIII")
@@ -520,8 +521,12 @@ def main():
     payload = dev.checked("HELLO", CMD_HELLO)
     proto, slot_count, max_pkt, caps, fw = INFO.unpack_from(payload)
     fw = fw.split(b"\0", 1)[0].decode(errors="replace")
-    print("Shuriken proto=%d fw=%s slots=%d max_packet=%d caps=%s" % (
-        proto, fw, slot_count, max_pkt,
+    if len(payload) >= INFO.size + INFO_REV.size:
+        proto_rev = "%d.%d.%d" % INFO_REV.unpack_from(payload, INFO.size)
+    else:
+        proto_rev = "unknown"  # Firmware older than 2026.10.1.
+    print("Shuriken proto=%d rev=%s fw=%s slots=%d max_packet=%d caps=%s" % (
+        proto, proto_rev, fw, slot_count, max_pkt,
         ",".join(n for b, n in ((CAP_SYNTHETIC, "synthetic"),
                                 (CAP_RADIO_MONITOR, "monitor"),
                                 (CAP_CHANNEL_HOP, "hop")) if caps & b) or "none"),

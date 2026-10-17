@@ -60,7 +60,7 @@ reply record echoing its sequence number and a status byte.
 
 | Command | Effect |
 |---|---|
-| `HELLO` (0x01) | Starts a fresh host session: stops any session a previous host left running, drops queued output, and **restores every slot's default channel, hop and filter settings**. Replies with `UsbCaptureInfo` (slot count, max packet size, capabilities). |
+| `HELLO` (0x01) | Starts a fresh host session: stops any session a previous host left running, drops queued output, and **restores every slot's default channel, hop and filter settings**. Replies with `UsbCaptureInfo` (slot count, max packet size, capabilities, firmware version, and the dated protocol revision `proto_rev_year.month.number`, starting at 2026.10.1; firmware without it sends a reply 4 bytes shorter). |
 | `SET_CHANNEL` (0x05) | Fixed channel for the slots in `slot_mask`; clears hopping on them. |
 | `SET_HOP` (0x06) | Hop list (≤ 64 entries) and dwell (≥ 10 ms) for the slots in `slot_mask`. With `USB_CAPTURE_HOP_STAGGER`, each slot starts at a different point in the list. |
 | `SET_FILTER` (0x07) | Frame types (mgmt/ctrl/data), per-type snaplen (0 = whole frame) and the data mode (see [Frame filter](#frame-filter)). The 8-byte form without `data_mode` selects the default mode. The `FCS_FAIL` bit is ignored for radio capture; scanners only deliver frames received intact. |
@@ -350,7 +350,7 @@ tunes 20 MHz.
 ## Example host session
 
 ```
-HELLO                                   -> OK, info (6 slots, caps: synthetic, monitor, hop)
+HELLO                                   -> OK, info (rev 2026.10.1, 6 slots, caps: synthetic, monitor, hop)
 SET_FILTER  slots=0x3f  mgmt+data, no snaplen, data PASS_HANDSHAKE
 SET_HOP     slots=0x3f  stagger, dwell 200 ms, [1 6 11 36 40 48 161]
 START       slots=0x3f                  -> OK

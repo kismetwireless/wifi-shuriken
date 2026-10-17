@@ -17,6 +17,13 @@
 static constexpr uint16_t USB_CAPTURE_MAGIC = 0x4853;  // "SH" on the wire.
 static constexpr uint8_t USB_CAPTURE_PROTO_VERSION = 1;
 
+// Dated protocol revision (year.month.revision), reported in UsbCaptureInfo.
+// Bump it whenever the wire format or command semantics change; the record
+// header's proto_version only changes for incompatible framing.
+static constexpr uint16_t USB_CAPTURE_PROTO_REV_YEAR = 2026;
+static constexpr uint8_t USB_CAPTURE_PROTO_REV_MONTH = 10;
+static constexpr uint8_t USB_CAPTURE_PROTO_REV_NUMBER = 1;
+
 // Interface identification so hosts can find the capture interface without
 // reading string descriptors.
 static constexpr uint8_t USB_CAPTURE_IFACE_SUBCLASS = 0x53;
@@ -188,6 +195,10 @@ struct __attribute__((packed)) UsbCaptureInfo {
   uint16_t max_packet_bytes;
   uint32_t capabilities;
   char firmware_version[16];
+  // USB_CAPTURE_PROTO_REV_*. Absent (reply 4 bytes shorter) before 2026.10.1.
+  uint16_t proto_rev_year;
+  uint8_t proto_rev_month;
+  uint8_t proto_rev_number;
 };
 
 // Followed by cap_len bytes of 802.11 frame.
@@ -287,7 +298,7 @@ static_assert(sizeof(UsbCaptureHopEntry) == 2, "UsbCaptureHopEntry must be 2 byt
 static_assert(sizeof(UsbCaptureSetHopCommand) == 8, "UsbCaptureSetHopCommand must be 8 bytes");
 static_assert(sizeof(UsbCaptureSetFilterCommand) == 12, "UsbCaptureSetFilterCommand must be 12 bytes");
 static_assert(sizeof(UsbCaptureReplyHeader) == 4, "UsbCaptureReplyHeader must be 4 bytes");
-static_assert(sizeof(UsbCaptureInfo) == 24, "UsbCaptureInfo must be 24 bytes");
+static_assert(sizeof(UsbCaptureInfo) == 28, "UsbCaptureInfo must be 28 bytes");
 static_assert(sizeof(UsbCapturePacketHeader) == 24, "UsbCapturePacketHeader must be 24 bytes");
 static_assert(sizeof(UsbCaptureSlotStatus) == 16, "UsbCaptureSlotStatus must be 16 bytes");
 static_assert(sizeof(UsbCaptureStatusHeader) == 24, "UsbCaptureStatusHeader must be 24 bytes");

@@ -495,6 +495,9 @@ void handleHello(const UsbCaptureRecordHeader& hdr) {
   info.capabilities |= USB_CAPTURE_CAP_SYNTHETIC;
 #endif
   strncpy(info.firmware_version, APP_VERSION, sizeof(info.firmware_version) - 1);
+  info.proto_rev_year = USB_CAPTURE_PROTO_REV_YEAR;
+  info.proto_rev_month = USB_CAPTURE_PROTO_REV_MONTH;
+  info.proto_rev_number = USB_CAPTURE_PROTO_REV_NUMBER;
   sendReply(hdr.type, hdr.seq, USB_CAPTURE_REPLY_OK, &info, sizeof(info));
 }
 

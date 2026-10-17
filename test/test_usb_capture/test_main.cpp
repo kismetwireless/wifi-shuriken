@@ -63,6 +63,16 @@ void test_packet_header_field_offsets() {
   TEST_ASSERT_EQUAL_UINT32(22, offsetof(UsbCapturePacketHeader, cap_len));
 }
 
+void test_info_protocol_revision() {
+  // Appended after the version-1 fields so older hosts still parse the prefix.
+  TEST_ASSERT_EQUAL_UINT32(24, offsetof(UsbCaptureInfo, proto_rev_year));
+  TEST_ASSERT_EQUAL_UINT32(26, offsetof(UsbCaptureInfo, proto_rev_month));
+  TEST_ASSERT_EQUAL_UINT32(27, offsetof(UsbCaptureInfo, proto_rev_number));
+  TEST_ASSERT_EQUAL_UINT16(2026, USB_CAPTURE_PROTO_REV_YEAR);
+  TEST_ASSERT_EQUAL_UINT8(10, USB_CAPTURE_PROTO_REV_MONTH);
+  TEST_ASSERT_EQUAL_UINT8(1, USB_CAPTURE_PROTO_REV_NUMBER);
+}
+
 void test_channel_validation() {
   TEST_ASSERT_TRUE(usbCaptureChannelValid(USB_CAPTURE_BAND_24GHZ, 1));
   TEST_ASSERT_TRUE(usbCaptureChannelValid(USB_CAPTURE_BAND_24GHZ, 14));
@@ -192,6 +202,7 @@ int main(int, char**) {
   RUN_TEST(test_protocol_values_are_stable);
   RUN_TEST(test_record_header_wire_layout);
   RUN_TEST(test_packet_header_field_offsets);
+  RUN_TEST(test_info_protocol_revision);
   RUN_TEST(test_channel_validation);
   RUN_TEST(test_ring_capacity_validation);
   RUN_TEST(test_ring_two_segment_write_round_trips);
